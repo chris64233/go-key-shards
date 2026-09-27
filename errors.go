@@ -20,10 +20,20 @@ var (
 	ErrDeadlineExceeded = errors.New("keyshards: ceremony deadline exceeded")
 	// ErrAlreadyContributed 同一参与者在同一轮次只能贡献一次。
 	ErrAlreadyContributed = errors.New("keyshards: participant already contributed in this round")
-	// ErrConflict 同一请求号携带了不同的贡献内容（参与者、承诺或摘要不一致）。
+	// ErrConflict 同一请求号携带了不同的内容（参与者、承诺或摘要不一致）。
 	ErrConflict = errors.New("keyshards: idempotency conflict")
 	// ErrThresholdNotReached 有效贡献数量尚未达到门限，不能完成仪式。
 	ErrThresholdNotReached = errors.New("keyshards: threshold not reached")
 	// ErrCeremonyTerminal 仪式已处于终态（completed/canceled/expired），不能再变更。
 	ErrCeremonyTerminal = errors.New("keyshards: ceremony already in terminal state")
+
+	// ErrReplacementNotFound 替换请求号不存在。
+	ErrReplacementNotFound = errors.New("keyshards: replacement request not found")
+	// ErrReplacementFinal 替换请求已处于终态（approved/rejected/closed），不能再批准或撤销。
+	ErrReplacementFinal = errors.New("keyshards: replacement request already finalized")
+	// ErrAlreadyApproved 同一成员已经同意过该替换请求。
+	ErrAlreadyApproved = errors.New("keyshards: participant already approved this replacement")
+	// ErrApproverNotContinuing 批准人不在替换后的成员集合中：只有继续参与的成员
+	// （新旧成员集合的交集）才有同意权，被替换出去的人不能批准自己的替换。
+	ErrApproverNotContinuing = errors.New("keyshards: approver is not a continuing participant")
 )

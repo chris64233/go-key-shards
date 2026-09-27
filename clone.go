@@ -35,6 +35,49 @@ func cloneRound(r *Round) *Round {
 		Threshold:     r.Threshold,
 		Contributions: cs,
 		StartedAt:     r.StartedAt,
+		Deadline:      r.Deadline,
+	}
+}
+
+func cloneReplacement(req *Replacement) *Replacement {
+	if req == nil {
+		return nil
+	}
+	invalidated := make([]Contribution, len(req.InvalidatedContributions))
+	for i, cv := range req.InvalidatedContributions {
+		invalidated[i] = *cloneContribution(&cv)
+	}
+	return &Replacement{
+		ID:                       req.ID,
+		Status:                   req.Status,
+		RequestedBy:              req.RequestedBy,
+		Reason:                   req.Reason,
+		NewMembers:               append([]string(nil), req.NewMembers...),
+		NewDeadline:              req.NewDeadline,
+		TargetRound:              req.TargetRound,
+		Approvers:                append([]string(nil), req.Approvers...),
+		Rejecters:                append([]string(nil), req.Rejecters...),
+		PreviousRound:            req.PreviousRound,
+		NewRoundNumber:           req.NewRoundNumber,
+		InvalidatedContributions: invalidated,
+		CreatedAt:                req.CreatedAt,
+		DecidedAt:                req.DecidedAt,
+	}
+}
+
+func cloneNotification(n Notification) Notification {
+	detail := make(map[string]any, len(n.Detail))
+	for k, v := range n.Detail {
+		detail[k] = v
+	}
+	return Notification{
+		Seq:           n.Seq,
+		CeremonyID:    n.CeremonyID,
+		At:            n.At,
+		Type:          n.Type,
+		ReplacementID: n.ReplacementID,
+		RoundNumber:   n.RoundNumber,
+		Detail:        detail,
 	}
 }
 
@@ -64,6 +107,14 @@ func cloneCeremony(c *Ceremony) *Ceremony {
 	for i, r := range c.Rounds {
 		rounds[i] = cloneRound(r)
 	}
+	reps := make(map[string]*Replacement, len(c.Replacements))
+	for k, v := range c.Replacements {
+		reps[k] = cloneReplacement(v)
+	}
+	ntfs := make([]Notification, len(c.Notifications))
+	for i, n := range c.Notifications {
+		ntfs[i] = cloneNotification(n)
+	}
 	idem := make(map[string]*IdemRecord, len(c.Idempotency))
 	for k, v := range c.Idempotency {
 		if v == nil {
@@ -74,15 +125,17 @@ func cloneCeremony(c *Ceremony) *Ceremony {
 		idem[k] = &cp
 	}
 	return &Ceremony{
-		ID:           c.ID,
-		Threshold:    c.Threshold,
-		Deadline:     c.Deadline,
-		CreatedAt:    c.CreatedAt,
-		CancelReason: c.CancelReason,
-		Rounds:       rounds,
-		Status:       c.Status,
-		Outbox:       cloneOutbox(c.Outbox),
-		Idempotency:  idem,
+		ID:            c.ID,
+		Threshold:     c.Threshold,
+		Deadline:      c.Deadline,
+		CreatedAt:     c.CreatedAt,
+		CancelReason:  c.CancelReason,
+		Rounds:        rounds,
+		Replacements:  reps,
+		Notifications: ntfs,
+		Status:        c.Status,
+		Outbox:        cloneOutbox(c.Outbox),
+		Idempotency:   idem,
 	}
 }
 

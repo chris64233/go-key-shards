@@ -86,6 +86,33 @@ func contrib(t *testing.T, s *Service, id, reqID string, round int, c Contributi
 	return res
 }
 
+func initiate(t *testing.T, s *Service, id, reqID, by string, members []string, newDeadline time.Time, reason string) *Replacement {
+	t.Helper()
+	rep, err := s.InitiateReplacement(context.Background(), InitiateReplacementInput{
+		CeremonyID:  id,
+		RequestID:   reqID,
+		RequestedBy: by,
+		NewMembers:  members,
+		NewDeadline: newDeadline,
+		Reason:      reason,
+	})
+	if err != nil {
+		t.Fatalf("InitiateReplacement(%s): %v", reqID, err)
+	}
+	return rep
+}
+
+func approve(t *testing.T, s *Service, id, reqID, voteID, voter string) *Replacement {
+	t.Helper()
+	rep, err := s.ApproveReplacement(context.Background(), ApprovalInput{
+		CeremonyID: id, RequestID: reqID, VoteRequestID: voteID, Voter: voter,
+	})
+	if err != nil {
+		t.Fatalf("ApproveReplacement(%s by %s): %v", reqID, voter, err)
+	}
+	return rep
+}
+
 func errIs(err, target error) bool { return errors.Is(err, target) }
 
 // ---- 创建 ----
@@ -117,6 +144,9 @@ func TestCreateCeremonyFreezesConfig(t *testing.T) {
 			}
 			if r.Threshold != 2 {
 				t.Fatalf("round threshold = %d", r.Threshold)
+			}
+			if !r.Deadline.Equal(deadline) {
+				t.Fatalf("round deadline = %v", r.Deadline)
 			}
 
 			// 重复 ID 拒绝。
@@ -258,99 +288,538 @@ func TestSubmitContributionRejections(t *testing.T) {
 	}
 }
 
-// ---- 轮次替换 ----
+// ---- 参与者替换：门限批准、新轮冻结、旧贡献失效 ----
 
-func TestReplaceParticipantsOpensNewRound(t *testing.T) {
+// 达到门限数量的继续参与者同意后才生效；生效开启新轮并重新冻结成员与截止时间，
+// 旧轮贡献全部快照失效，新轮必须重新收集门限数量的贡献。
+func TestReplacementThresholdApprovalsAndFreshRound(t *testing.T) {
 	for _, f := range fixtures(t) {
 		t.Run(f.name, func(t *testing.T) {
 			clk := newFakeClock()
 			s := NewService(f.new(t), clk.now)
-			mustCreate(t, s, "c", []string{"a", "b", "c"}, 2, clk.now().Add(2*time.Hour))
+			mustCreate(t, s, "c", []string{"a", "b", "c", "d"}, 3, clk.now().Add(24*time.Hour))
 
+			// 旧轮已有 a、b 两个贡献（未达门限 3）。
 			contrib(t, s, "c", "req-a", 1, cv("a", 1))
-			contrib(t, s, "c", "req-b", 1, cv("b", 1))
+			contrib(t, s, "c", "req-b", 1, cv("b", 2))
 
-			// 显式开启新一轮替换成员：旧轮 2 个贡献失效，门限重新计数。
-			rn, err := s.ReplaceParticipants(context.Background(), ReplaceParticipantsInput{
-				CeremonyID: "c", RequestID: "rep-1", NewMembers: []string{"a", "d", "e"}, Reason: "b rotated",
-			})
-			if err != nil {
-				t.Fatalf("ReplaceParticipants: %v", err)
+			newDeadline := clk.now().Add(48 * time.Hour)
+			// a 发起替换 b：新集合 [a c d e]，继续参与者为 a、c、d。
+			rep := initiate(t, s, "c", "rep-1", "a", []string{"a", "c", "d", "e"}, newDeadline, "rotate b")
+			if rep.Status != ReplacementPending || !equalStrings(rep.Approvers, []string{"a"}) {
+				t.Fatalf("after initiate: %+v", rep)
 			}
-			if rn != 2 {
-				t.Fatalf("new round = %d, want 2", rn)
-			}
-
 			got, _ := s.GetCeremony(context.Background(), "c")
-			if len(got.Rounds) != 2 {
-				t.Fatalf("rounds = %d", len(got.Rounds))
+			if got.CurrentRound().Number != 1 {
+				t.Fatalf("round must not change while pending")
 			}
-			cur := got.CurrentRound()
-			if !equalStrings(cur.Members, []string{"a", "d", "e"}) {
+
+			// 被替换出去的 b 没有批准权。
+			_, err := s.ApproveReplacement(context.Background(), ApprovalInput{
+				CeremonyID: "c", RequestID: "rep-1", VoteRequestID: "vote-b", Voter: "b",
+			})
+			if !errIs(err, ErrApproverNotContinuing) {
+				t.Fatalf("removed member vote err = %v", err)
+			}
+
+			// c 同意：2/3，仍不生效。
+			rep = approve(t, s, "c", "rep-1", "vote-c", "c")
+			if rep.Status != ReplacementPending || !equalStrings(rep.Approvers, []string{"a", "c"}) {
+				t.Fatalf("after c vote: %+v", rep)
+			}
+			got, _ = s.GetCeremony(context.Background(), "c")
+			if got.CurrentRound().Number != 1 {
+				t.Fatalf("round must not change before threshold")
+			}
+
+			// c 重复同意拒绝。
+			_, err = s.ApproveReplacement(context.Background(), ApprovalInput{
+				CeremonyID: "c", RequestID: "rep-1", VoteRequestID: "vote-c-again", Voter: "c",
+			})
+			if !errIs(err, ErrAlreadyApproved) {
+				t.Fatalf("duplicate vote err = %v", err)
+			}
+
+			// d 同意：3/3，同一事务生效。
+			rep = approve(t, s, "c", "rep-1", "vote-d", "d")
+			if rep.Status != ReplacementApproved || rep.NewRoundNumber != 2 || rep.PreviousRound != 1 {
+				t.Fatalf("after d vote: %+v", rep)
+			}
+			if !equalStrings(rep.Approvers, []string{"a", "c", "d"}) {
+				t.Fatalf("approvers = %v", rep.Approvers)
+			}
+			// 失效贡献快照：旧轮 a、b 的贡献，按旧轮成员顺序。
+			if ids := participantIDs(rep.InvalidatedContributions); !equalStrings(ids, []string{"a", "b"}) {
+				t.Fatalf("invalidated = %v, want [a b]", ids)
+			}
+
+			got, _ = s.GetCeremony(context.Background(), "c")
+			if len(got.Rounds) != 2 {
+				t.Fatalf("rounds = %d, want 2", len(got.Rounds))
+			}
+			old, cur := got.Rounds[0], got.CurrentRound()
+			if cur.Number != 2 {
+				t.Fatalf("current round = %d", cur.Number)
+			}
+			if !equalStrings(cur.Members, []string{"a", "c", "d", "e"}) {
 				t.Fatalf("new members = %v", cur.Members)
+			}
+			if !cur.Deadline.Equal(newDeadline) {
+				t.Fatalf("new round deadline = %v, want %v", cur.Deadline, newDeadline)
 			}
 			if len(cur.Contributions) != 0 {
 				t.Fatalf("new round must start with zero contributions")
 			}
+			// 旧轮数据仍保留可供审计关联，但已不代表有效集合。
+			if len(old.Contributions) != 2 {
+				t.Fatalf("old round contributions should be retained for audit, got %d", len(old.Contributions))
+			}
 
-			// 旧轮次贡献一律拒绝。
+			// 迟到的旧轮贡献不得带入新轮。
 			_, err = s.SubmitContribution(context.Background(), ContributeInput{
-				CeremonyID: "c", RequestID: "req-c-old", RoundNumber: 1, Contribution: cv("c", 1),
+				CeremonyID: "c", RequestID: "req-c-old", RoundNumber: 1, Contribution: cv("c", 3),
 			})
 			if !errIs(err, ErrStaleRound) {
-				t.Fatalf("stale round err = %v", err)
+				t.Fatalf("late old-round contribution err = %v", err)
 			}
 
-			// 旧轮次里的成员 a 的历史贡献不计入新轮：a 可以在新轮再贡献一次。
-			res := contrib(t, s, "c", "req-a-r2", 2, cv("a", 2))
-			if res.ContributionCount != 1 {
-				t.Fatalf("count on new round = %d", res.ContributionCount)
-			}
-
-			// 同请求号同成员集合重试：返回同一轮次，不重复开轮。
-			rn2, err := s.ReplaceParticipants(context.Background(), ReplaceParticipantsInput{
-				CeremonyID: "c", RequestID: "rep-1", NewMembers: []string{"a", "d", "e"},
+			// 新轮必须重新收集：1 个不够门限，不能完成。
+			contrib(t, s, "c", "req-a2", 2, cv("a", 4))
+			_, err = s.Complete(context.Background(), CompleteInput{
+				CeremonyID: "c", RequestID: "comp-early", KeyID: "k",
 			})
-			if err != nil || rn2 != 2 {
-				t.Fatalf("replace replay = (%d, %v)", rn2, err)
+			if !errIs(err, ErrThresholdNotReached) {
+				t.Fatalf("complete below threshold err = %v", err)
 			}
-			got, _ = s.GetCeremony(context.Background(), "c")
-			if len(got.Rounds) != 2 {
-				t.Fatalf("replay must not add a round, got %d", len(got.Rounds))
-			}
-
-			// 同请求号不同成员集合：冲突。
-			_, err = s.ReplaceParticipants(context.Background(), ReplaceParticipantsInput{
-				CeremonyID: "c", RequestID: "rep-1", NewMembers: []string{"a", "d"},
+			// 旧轮贡献绝不折算：再收集 c、d 后才达到门限 3。
+			contrib(t, s, "c", "req-c2", 2, cv("c", 5))
+			contrib(t, s, "c", "req-d2", 2, cv("d", 6))
+			ob, err := s.Complete(context.Background(), CompleteInput{
+				CeremonyID: "c", RequestID: "comp", KeyID: "k", Payload: []byte("agg"),
 			})
-			if !errIs(err, ErrConflict) {
-				t.Fatalf("replace conflict err = %v", err)
+			if err != nil {
+				t.Fatalf("Complete: %v", err)
+			}
+			if ob.RoundNumber != 2 {
+				t.Fatalf("outbox round = %d, want 2 (old round must not be reused)", ob.RoundNumber)
+			}
+			if ids := participantIDs(ob.Contributions); !equalStrings(ids, []string{"a", "c", "d"}) {
+				t.Fatalf("adopted = %v", ids)
 			}
 		})
 	}
 }
 
-func TestReplaceParticipantsValidationAndTerminal(t *testing.T) {
+// 门限为 1 时，继续参与者发起即生效（本人同意自动计入）。
+func TestReplacementThresholdOneAutoApproves(t *testing.T) {
 	clk := newFakeClock()
 	s := NewService(NewMemRepository(), clk.now)
-	mustCreate(t, s, "c", []string{"a", "b", "c"}, 3, clk.now().Add(time.Hour))
+	mustCreate(t, s, "c", []string{"a", "b"}, 1, clk.now().Add(24*time.Hour))
 
-	// 替换后人数低于冻结门限：拒绝。
-	_, err := s.ReplaceParticipants(context.Background(), ReplaceParticipantsInput{
-		CeremonyID: "c", RequestID: "rep", NewMembers: []string{"a", "b"},
+	rep := initiate(t, s, "c", "rep", "a", []string{"a", "c"}, clk.now().Add(48*time.Hour), "x")
+	if rep.Status != ReplacementApproved || rep.NewRoundNumber != 2 {
+		t.Fatalf("threshold-one replacement = %+v", rep)
+	}
+	got, _ := s.GetCeremony(context.Background(), "c")
+	if got.CurrentRound().Number != 2 {
+		t.Fatalf("current round = %d", got.CurrentRound().Number)
+	}
+}
+
+// 离场者本人可以发起替换但不计票：门限数量的同意全部来自继续参与者。
+func TestReplacementInitiatedByLeavingMember(t *testing.T) {
+	clk := newFakeClock()
+	s := NewService(NewMemRepository(), clk.now)
+	// 旧集合 a b c d，新集合 c d e f，继续参与者仅 c、d。
+	mustCreate(t, s, "c", []string{"a", "b", "c", "d"}, 2, clk.now().Add(24*time.Hour))
+
+	rep := initiate(t, s, "c", "rep", "a", []string{"c", "d", "e", "f"}, clk.now().Add(48*time.Hour), "a leaves")
+	if rep.Status != ReplacementPending || len(rep.Approvers) != 0 {
+		t.Fatalf("leaving initiator must not count as approver: %+v", rep)
+	}
+	rep = approve(t, s, "c", "rep", "vote-c", "c")
+	if rep.Status != ReplacementPending || len(rep.Approvers) != 1 {
+		t.Fatalf("after c: %+v", rep)
+	}
+	rep = approve(t, s, "c", "rep", "vote-d", "d")
+	if rep.Status != ReplacementApproved || rep.NewRoundNumber != 2 {
+		t.Fatalf("after d: %+v", rep)
+	}
+}
+
+// 继续参与者人数少于门限时，替换在发起阶段即被拒绝（数学上不可能获批）。
+func TestReplacementImpossibleQuorumRejected(t *testing.T) {
+	clk := newFakeClock()
+	s := NewService(NewMemRepository(), clk.now)
+	mustCreate(t, s, "c", []string{"a", "b", "c"}, 3, clk.now().Add(24*time.Hour))
+
+	_, err := s.InitiateReplacement(context.Background(), InitiateReplacementInput{
+		CeremonyID: "c", RequestID: "rep", RequestedBy: "a",
+		NewMembers: []string{"a", "x", "y"}, NewDeadline: clk.now().Add(time.Hour),
+	})
+	if !errIs(err, ErrInvalidArgument) {
+		t.Fatalf("impossible quorum err = %v", err)
+	}
+}
+
+func TestReplacementValidation(t *testing.T) {
+	clk := newFakeClock()
+	s := NewService(NewMemRepository(), clk.now)
+	mustCreate(t, s, "c", []string{"a", "b", "c"}, 2, clk.now().Add(24*time.Hour))
+
+	// 新人数低于门限。
+	_, err := s.InitiateReplacement(context.Background(), InitiateReplacementInput{
+		CeremonyID: "c", RequestID: "r1", RequestedBy: "a",
+		NewMembers: []string{"a"}, NewDeadline: clk.now().Add(time.Hour),
 	})
 	if !errIs(err, ErrInvalidArgument) {
 		t.Fatalf("below threshold err = %v", err)
 	}
+	// 成员集合未变化。
+	_, err = s.InitiateReplacement(context.Background(), InitiateReplacementInput{
+		CeremonyID: "c", RequestID: "r2", RequestedBy: "a",
+		NewMembers: []string{"a", "b", "c"}, NewDeadline: clk.now().Add(time.Hour),
+	})
+	if !errIs(err, ErrInvalidArgument) {
+		t.Fatalf("identical members err = %v", err)
+	}
+	// 新截止时间不在未来。
+	_, err = s.InitiateReplacement(context.Background(), InitiateReplacementInput{
+		CeremonyID: "c", RequestID: "r3", RequestedBy: "a",
+		NewMembers: []string{"a", "c"}, NewDeadline: clk.now().Add(-time.Minute),
+	})
+	if !errIs(err, ErrInvalidArgument) {
+		t.Fatalf("past deadline err = %v", err)
+	}
+	// 发起人不是当前轮成员。
+	_, err = s.InitiateReplacement(context.Background(), InitiateReplacementInput{
+		CeremonyID: "c", RequestID: "r4", RequestedBy: "zzz",
+		NewMembers: []string{"a", "c"}, NewDeadline: clk.now().Add(time.Hour),
+	})
+	if !errIs(err, ErrNotMember) {
+		t.Fatalf("outsider initiate err = %v", err)
+	}
+	// 批准不存在的请求。
+	_, err = s.ApproveReplacement(context.Background(), ApprovalInput{
+		CeremonyID: "c", RequestID: "nope", VoteRequestID: "v", Voter: "a",
+	})
+	if !errIs(err, ErrReplacementNotFound) {
+		t.Fatalf("vote missing err = %v", err)
+	}
+}
 
-	if err := s.Cancel(context.Background(), "c", "n/a"); err != nil {
+// ---- 替换请求幂等：同号重放原样返回，异内容冲突，跨越生效/终态仍可重放 ----
+
+func TestReplacementIdempotency(t *testing.T) {
+	for _, f := range fixtures(t) {
+		t.Run(f.name, func(t *testing.T) {
+			clk := newFakeClock()
+			s := NewService(f.new(t), clk.now)
+			mustCreate(t, s, "c", []string{"a", "b", "c"}, 2, clk.now().Add(24*time.Hour))
+			nd := clk.now().Add(48 * time.Hour)
+
+			first := initiate(t, s, "c", "rep", "a", []string{"a", "c", "d"}, nd, "x")
+			if first.Status != ReplacementPending {
+				t.Fatalf("first = %+v", first)
+			}
+
+			// 同号同内容重试：返回同一 pending 快照，不重复创建。
+			replay := initiate(t, s, "c", "rep", "a", []string{"a", "c", "d"}, nd, "x")
+			if replay.Status != ReplacementPending || replay.CreatedAt != first.CreatedAt {
+				t.Fatalf("replay = %+v", replay)
+			}
+			got, _ := s.GetCeremony(context.Background(), "c")
+			if len(got.Replacements) != 1 {
+				t.Fatalf("replacements = %d, want 1", len(got.Replacements))
+			}
+
+			// 同号不同新成员集合：冲突。
+			_, err := s.InitiateReplacement(context.Background(), InitiateReplacementInput{
+				CeremonyID: "c", RequestID: "rep", RequestedBy: "a",
+				NewMembers: []string{"a", "c"}, NewDeadline: nd,
+			})
+			if !errIs(err, ErrConflict) {
+				t.Fatalf("conflict err = %v", err)
+			}
+
+			// 投票同号重试：返回请求当前快照，不重复计票。
+			approve(t, s, "c", "rep", "vote-c", "c")
+			again := approve(t, s, "c", "rep", "vote-c", "c")
+			if again.Status != ReplacementApproved || again.NewRoundNumber != 2 {
+				t.Fatalf("vote replay = %+v", again)
+			}
+			got, _ = s.GetCeremony(context.Background(), "c")
+			if len(got.Rounds) != 2 {
+				t.Fatalf("vote replay must not open another round, got %d", len(got.Rounds))
+			}
+
+			// 生效后发起请求同号重放：原样返回 approved 快照（含新轮次号）。
+			after := initiate(t, s, "c", "rep", "a", []string{"a", "c", "d"}, nd, "x")
+			if after.Status != ReplacementApproved || after.NewRoundNumber != 2 {
+				t.Fatalf("post-effect replay = %+v", after)
+			}
+
+			// 投票同号但换了批准对象：冲突。
+			_, err = s.ApproveReplacement(context.Background(), ApprovalInput{
+				CeremonyID: "c", RequestID: "rep", VoteRequestID: "vote-c", Voter: "d",
+			})
+			if !errIs(err, ErrConflict) {
+				t.Fatalf("vote reuse err = %v", err)
+			}
+
+			// 仪式完成后，替换请求同号重放仍返回其首次结果，而不是终态错误。
+			contrib(t, s, "c", "ra2", 2, cv("a", 1))
+			contrib(t, s, "c", "rc2", 2, cv("c", 2))
+			if _, err := s.Complete(context.Background(), CompleteInput{
+				CeremonyID: "c", RequestID: "done", KeyID: "k",
+			}); err != nil {
+				t.Fatal(err)
+			}
+			postTerminal := initiate(t, s, "c", "rep", "a", []string{"a", "c", "d"}, nd, "x")
+			if postTerminal.Status != ReplacementApproved {
+				t.Fatalf("replay after terminal = %+v", postTerminal)
+			}
+		})
+	}
+}
+
+// ---- 终态与待决替换互斥：仪式进入终态的同一事务关闭全部 pending 请求 ----
+
+func TestPendingReplacementsClosedOnTerminal(t *testing.T) {
+	t.Run("completed", func(t *testing.T) {
+		clk := newFakeClock()
+		s := NewService(NewMemRepository(), clk.now)
+		mustCreate(t, s, "c", []string{"a", "b", "c"}, 2, clk.now().Add(24*time.Hour))
+		// rep-1 待决；第 1 轮门限恰好达成，完成与替换竞争。
+		initiate(t, s, "c", "rep-1", "a", []string{"a", "c", "d"}, clk.now().Add(48*time.Hour), "")
+		contrib(t, s, "c", "ra", 1, cv("a", 1))
+		contrib(t, s, "c", "rb", 1, cv("b", 2))
+		if _, err := s.Complete(context.Background(), CompleteInput{
+			CeremonyID: "c", RequestID: "done", KeyID: "k",
+		}); err != nil {
+			t.Fatal(err)
+		}
+		rep, err := s.GetReplacement(context.Background(), "c", "rep-1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if rep.Status != ReplacementClosed {
+			t.Fatalf("replacement after complete = %s", rep.Status)
+		}
+		// 关闭后再批准被拒（仪式已终态，返回终态错误），且不会偷偷开新轮。
+		if _, err := s.ApproveReplacement(context.Background(), ApprovalInput{
+			CeremonyID: "c", RequestID: "rep-1", VoteRequestID: "v", Voter: "c",
+		}); !errIs(err, ErrCeremonyTerminal) {
+			t.Fatalf("vote after close err = %v", err)
+		}
+		got, _ := s.GetCeremony(context.Background(), "c")
+		if len(got.Rounds) != 1 {
+			t.Fatalf("closed replacement must not open a round, got %d", len(got.Rounds))
+		}
+	})
+
+	t.Run("canceled", func(t *testing.T) {
+		clk := newFakeClock()
+		s := NewService(NewMemRepository(), clk.now)
+		mustCreate(t, s, "c", []string{"a", "b", "c"}, 2, clk.now().Add(24*time.Hour))
+		initiate(t, s, "c", "rep-1", "a", []string{"a", "c", "d"}, clk.now().Add(48*time.Hour), "")
+		if err := s.Cancel(context.Background(), "c", "abort"); err != nil {
+			t.Fatal(err)
+		}
+		rep, _ := s.GetReplacement(context.Background(), "c", "rep-1")
+		if rep.Status != ReplacementClosed {
+			t.Fatalf("replacement after cancel = %s", rep.Status)
+		}
+	})
+
+	t.Run("expired", func(t *testing.T) {
+		clk := newFakeClock()
+		s := NewService(NewMemRepository(), clk.now)
+		mustCreate(t, s, "c", []string{"a", "b", "c"}, 2, clk.now().Add(time.Hour))
+		initiate(t, s, "c", "rep-1", "a", []string{"a", "c", "d"}, clk.now().Add(48*time.Hour), "")
+
+		// 越过当前轮（第 1 轮）截止时间；下一次操作惰性过期并同事务关闭请求。
+		clk.advance(2 * time.Hour)
+		_, err := s.ApproveReplacement(context.Background(), ApprovalInput{
+			CeremonyID: "c", RequestID: "rep-1", VoteRequestID: "v-c", Voter: "c",
+		})
+		if !errIs(err, ErrDeadlineExceeded) {
+			t.Fatalf("vote after deadline err = %v", err)
+		}
+		got, _ := s.GetCeremony(context.Background(), "c")
+		if got.Status != StatusExpired {
+			t.Fatalf("status = %s", got.Status)
+		}
+		rep := got.Replacements["rep-1"]
+		if rep.Status != ReplacementClosed {
+			t.Fatalf("replacement after expiry = %s", rep.Status)
+		}
+	})
+}
+
+// 一个请求生效开启新轮时，其他待决请求在同一事务内被关闭，不能再就旧轮生效。
+func TestApprovedReplacementClosesOtherPending(t *testing.T) {
+	clk := newFakeClock()
+	s := NewService(NewMemRepository(), clk.now)
+	mustCreate(t, s, "c", []string{"a", "b", "c"}, 2, clk.now().Add(24*time.Hour))
+	initiate(t, s, "c", "rep-1", "a", []string{"a", "c", "d"}, clk.now().Add(48*time.Hour), "")
+	initiate(t, s, "c", "rep-2", "a", []string{"a", "b", "d"}, clk.now().Add(48*time.Hour), "")
+
+	approve(t, s, "c", "rep-1", "v-c", "c") // rep-1 生效开启第 2 轮
+
+	rep2, err := s.GetReplacement(context.Background(), "c", "rep-2")
+	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = s.ReplaceParticipants(context.Background(), ReplaceParticipantsInput{
-		CeremonyID: "c", RequestID: "rep2", NewMembers: []string{"a", "b", "c"},
-	})
-	if !errIs(err, ErrCeremonyTerminal) {
-		t.Fatalf("replace after cancel err = %v", err)
+	if rep2.Status != ReplacementClosed {
+		t.Fatalf("competing request = %s, want closed", rep2.Status)
+	}
+	if _, err := s.ApproveReplacement(context.Background(), ApprovalInput{
+		CeremonyID: "c", RequestID: "rep-2", VoteRequestID: "v-b", Voter: "b",
+	}); !errIs(err, ErrReplacementFinal) {
+		t.Fatalf("vote on closed err = %v", err)
+	}
+}
+
+// ---- 撤销 ----
+
+func TestWithdrawReplacement(t *testing.T) {
+	clk := newFakeClock()
+	s := NewService(NewMemRepository(), clk.now)
+	mustCreate(t, s, "c", []string{"a", "b", "c"}, 2, clk.now().Add(24*time.Hour))
+	initiate(t, s, "c", "rep-1", "a", []string{"a", "c", "d"}, clk.now().Add(48*time.Hour), "")
+
+	// 非发起人不能撤销。
+	if err := s.WithdrawReplacement(context.Background(), "c", "rep-1", "b"); !errIs(err, ErrInvalidArgument) {
+		t.Fatalf("withdraw by other err = %v", err)
+	}
+	if err := s.WithdrawReplacement(context.Background(), "c", "rep-1", "a"); err != nil {
+		t.Fatalf("Withdraw: %v", err)
+	}
+	rep, _ := s.GetReplacement(context.Background(), "c", "rep-1")
+	if rep.Status != ReplacementRejected {
+		t.Fatalf("after withdraw = %s", rep.Status)
+	}
+	// 撤销后投票被拒，重复撤销幂等。
+	if _, err := s.ApproveReplacement(context.Background(), ApprovalInput{
+		CeremonyID: "c", RequestID: "rep-1", VoteRequestID: "v", Voter: "c",
+	}); !errIs(err, ErrReplacementFinal) {
+		t.Fatalf("vote after withdraw err = %v", err)
+	}
+	if err := s.WithdrawReplacement(context.Background(), "c", "rep-1", "a"); err != nil {
+		t.Fatalf("idempotent withdraw err = %v", err)
+	}
+}
+
+// ---- 通知：与状态迁移在同一事务保存 ----
+
+func TestReplacementNotificationsTransactional(t *testing.T) {
+	for _, f := range fixtures(t) {
+		t.Run(f.name, func(t *testing.T) {
+			clk := newFakeClock()
+			s := NewService(f.new(t), clk.now)
+			mustCreate(t, s, "c", []string{"a", "b", "c"}, 2, clk.now().Add(24*time.Hour))
+			contrib(t, s, "c", "ra", 1, cv("a", 1))
+
+			nd := clk.now().Add(48 * time.Hour)
+			initiate(t, s, "c", "rep-1", "a", []string{"a", "c", "d"}, nd, "rotate b")
+			ntfs, err := s.Notifications(context.Background(), "c", 0, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(ntfs) != 1 || ntfs[0].Type != NtfReplacementInitiated ||
+				ntfs[0].ReplacementID != "rep-1" {
+				t.Fatalf("notifications after initiate = %+v", ntfs)
+			}
+
+			// 生效事务同时写出 approved 通知，负载关联新旧轮次、批准人与失效贡献。
+			approve(t, s, "c", "rep-1", "v-c", "c")
+			ntfs, _ = s.Notifications(context.Background(), "c", 0, 0)
+			if len(ntfs) != 2 {
+				t.Fatalf("notifications = %d, want 2", len(ntfs))
+			}
+			approved := ntfs[1]
+			if approved.Type != NtfReplacementApproved || approved.RoundNumber != 2 ||
+				approved.Detail["previous_round"] != 1 {
+				t.Fatalf("approved notification = %+v", approved)
+			}
+			invalidated, _ := approved.Detail["invalidated_contributions"].([]string)
+			if !equalStrings(invalidated, []string{"a"}) {
+				t.Fatalf("invalidated in notification = %v", invalidated)
+			}
+			approvers, _ := approved.Detail["approvers"].([]string)
+			if !equalStrings(approvers, []string{"a", "c"}) {
+				t.Fatalf("approvers in notification = %v", approvers)
+			}
+			// 通知状态与仪式状态在同一快照中一致：当前轮已是第 2 轮。
+			got, _ := s.GetCeremony(context.Background(), "c")
+			if got.CurrentRound().Number != 2 {
+				t.Fatalf("state/notif divergence: round %d", got.CurrentRound().Number)
+			}
+			for i := range ntfs {
+				if ntfs[i].Seq != int64(i+1) {
+					t.Fatalf("notification seq gap at %d: %d", i, ntfs[i].Seq)
+				}
+			}
+
+			// 完成事务追加完成通知。
+			contrib(t, s, "c", "ra2", 2, cv("a", 2))
+			contrib(t, s, "c", "rc2", 2, cv("c", 3))
+			if _, err := s.Complete(context.Background(), CompleteInput{
+				CeremonyID: "c", RequestID: "done", KeyID: "k",
+			}); err != nil {
+				t.Fatal(err)
+			}
+			ntfs, _ = s.Notifications(context.Background(), "c", 0, 0)
+			if len(ntfs) != 3 || ntfs[2].Type != NtfCeremonyCompleted {
+				t.Fatalf("notifications after complete = %+v", ntfs)
+			}
+
+			// fromSeq 分页。
+			page, _ := s.Notifications(context.Background(), "c", 1, 1)
+			if len(page) != 1 || page[0].Type != NtfReplacementApproved || page[0].Seq != 2 {
+				t.Fatalf("page = %+v", page)
+			}
+		})
+	}
+}
+
+// ---- 关联查询：新旧轮次、批准人、失效贡献 ----
+
+func TestReplacementLookup(t *testing.T) {
+	clk := newFakeClock()
+	s := NewService(NewMemRepository(), clk.now)
+	mustCreate(t, s, "c", []string{"a", "b", "c"}, 2, clk.now().Add(24*time.Hour))
+	contrib(t, s, "c", "ra", 1, cv("a", 1))
+	contrib(t, s, "c", "rb", 1, cv("b", 2))
+	initiate(t, s, "c", "rep-1", "a", []string{"a", "c", "d"}, clk.now().Add(48*time.Hour), "r1")
+	initiate(t, s, "c", "rep-2", "b", []string{"b", "c", "d"}, clk.now().Add(72*time.Hour), "r2")
+	approve(t, s, "c", "rep-1", "vc", "c")
+
+	rep, err := s.GetReplacement(context.Background(), "c", "rep-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.PreviousRound != 1 || rep.NewRoundNumber != 2 ||
+		!equalStrings(rep.Approvers, []string{"a", "c"}) {
+		t.Fatalf("rep-1 = %+v", rep)
+	}
+	if len(rep.InvalidatedContributions) != 2 {
+		t.Fatalf("invalidated = %d", len(rep.InvalidatedContributions))
+	}
+	if _, err := s.GetReplacement(context.Background(), "c", "missing"); !errIs(err, ErrReplacementNotFound) {
+		t.Fatalf("missing lookup err = %v", err)
+	}
+
+	all, err := s.ListReplacements(context.Background(), "c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 2 || all[0].ID != "rep-1" || all[1].ID != "rep-2" {
+		t.Fatalf("ordered replacements = %+v", all)
+	}
+	if all[1].Status != ReplacementClosed {
+		t.Fatalf("rep-2 should be closed, got %s", all[1].Status)
 	}
 }
 
@@ -416,8 +885,9 @@ func TestCompleteThresholdAndFrozenOutbox(t *testing.T) {
 			if err := s.Cancel(context.Background(), "c", "x"); !errIs(err, ErrCeremonyTerminal) {
 				t.Fatalf("cancel after complete err = %v", err)
 			}
-			_, err = s.ReplaceParticipants(context.Background(), ReplaceParticipantsInput{
-				CeremonyID: "c", RequestID: "rep", NewMembers: []string{"a", "b"},
+			_, err = s.InitiateReplacement(context.Background(), InitiateReplacementInput{
+				CeremonyID: "c", RequestID: "rep", RequestedBy: "a",
+				NewMembers: []string{"a", "c"}, NewDeadline: clk.now().Add(time.Hour),
 			})
 			if !errIs(err, ErrCeremonyTerminal) {
 				t.Fatalf("replace after complete err = %v", err)
@@ -527,6 +997,34 @@ func TestExpiryLazyAndDeadlineForNewOps(t *testing.T) {
 	}
 }
 
+// 新轮冻结的是新截止时间：旧截止时间已过不影响新轮，新轮过期只认新值。
+func TestNewRoundUsesRefrozenDeadline(t *testing.T) {
+	clk := newFakeClock()
+	s := NewService(NewMemRepository(), clk.now)
+	mustCreate(t, s, "c", []string{"a", "b"}, 1, clk.now().Add(time.Hour))
+	// 旧轮即将过期前替换：threshold 1，发起即生效。
+	clk.advance(59 * time.Minute)
+	initiate(t, s, "c", "rep", "a", []string{"a", "c"}, clk.now().Add(2*time.Hour), "extend")
+	// 越过旧轮截止时间，但新轮截止更晚：贡献仍被接受。
+	clk.advance(30 * time.Minute)
+	res := contrib(t, s, "c", "ra2", 2, cv("a", 1))
+	if res.RoundNumber != 2 {
+		t.Fatalf("contribution round = %d", res.RoundNumber)
+	}
+	// 越过新轮截止时间：惰性过期。
+	clk.advance(3 * time.Hour)
+	_, err := s.SubmitContribution(context.Background(), ContributeInput{
+		CeremonyID: "c", RequestID: "rc-late", RoundNumber: 2, Contribution: cv("c", 2),
+	})
+	if !errIs(err, ErrDeadlineExceeded) {
+		t.Fatalf("after new deadline err = %v", err)
+	}
+	got, _ := s.GetCeremony(context.Background(), "c")
+	if got.Status != StatusExpired {
+		t.Fatalf("status = %s", got.Status)
+	}
+}
+
 // ---- 审计 ----
 
 func TestAuditTrail(t *testing.T) {
@@ -604,12 +1102,9 @@ func TestContributionReplaySurvivesRoundReplacementAndTerminal(t *testing.T) {
 				t.Fatalf("first = %+v", first)
 			}
 
-			// 替换参与者开启新一轮。
-			if _, err := s.ReplaceParticipants(context.Background(), ReplaceParticipantsInput{
-				CeremonyID: "c", RequestID: "rep", NewMembers: []string{"a", "b", "c"},
-			}); err != nil {
-				t.Fatal(err)
-			}
+			// 替换参与者开启新一轮（a 发起 + b 批准）。
+			initiate(t, s, "c", "rep", "a", []string{"a", "b", "c", "d"}, clk.now().Add(48*time.Hour), "")
+			approve(t, s, "c", "rep", "vote-b", "b")
 
 			// 旧轮次已 stale，但同一请求号重试返回首次结果，而不是 ErrStaleRound。
 			replayAfterReplace := contrib(t, s, "c", "req-a", 1, cv("a", 1))
@@ -653,11 +1148,9 @@ func TestReplaceAndCompleteReplayAfterTerminal(t *testing.T) {
 	mustCreate(t, s, "c", []string{"a", "b"}, 1, clk.now().Add(24*time.Hour))
 	contrib(t, s, "c", "req-a", 1, cv("a", 1))
 
-	rn, err := s.ReplaceParticipants(context.Background(), ReplaceParticipantsInput{
-		CeremonyID: "c", RequestID: "rep", NewMembers: []string{"a", "b"},
-	})
-	if err != nil || rn != 2 {
-		t.Fatalf("replace = (%d, %v)", rn, err)
+	rep := initiate(t, s, "c", "rep", "a", []string{"a", "b", "c"}, clk.now().Add(48*time.Hour), "")
+	if rep.NewRoundNumber != 2 {
+		t.Fatalf("replace = %+v", rep)
 	}
 	contrib(t, s, "c", "req-b2", 2, cv("b", 2))
 	ob, err := s.Complete(context.Background(), CompleteInput{
@@ -667,12 +1160,10 @@ func TestReplaceAndCompleteReplayAfterTerminal(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// 完成后替换请求重放仍返回其开启的轮次号。
-	rn2, err := s.ReplaceParticipants(context.Background(), ReplaceParticipantsInput{
-		CeremonyID: "c", RequestID: "rep", NewMembers: []string{"a", "b"},
-	})
-	if err != nil || rn2 != 2 {
-		t.Fatalf("replace replay after complete = (%d, %v)", rn2, err)
+	// 完成后替换请求重放仍返回其 approved 记录（新轮次号 2）。
+	rep2 := initiate(t, s, "c", "rep", "a", []string{"a", "b", "c"}, clk.now().Add(48*time.Hour), "")
+	if rep2.Status != ReplacementApproved || rep2.NewRoundNumber != 2 {
+		t.Fatalf("replace replay after complete = %+v", rep2)
 	}
 	// 完成请求同号重放返回同一 outbox。
 	ob2, err := s.Complete(context.Background(), CompleteInput{
@@ -703,7 +1194,7 @@ func TestFileRepositoryPersistenceAndOutboxFile(t *testing.T) {
 		}
 		defer repo.Close()
 		s := NewService(repo, clk.now)
-		mustCreate(t, s, "c", []string{"a", "b", "c"}, 2, clk.now().Add(time.Hour))
+		mustCreate(t, s, "c", []string{"a", "b", "c"}, 2, clk.now().Add(24*time.Hour))
 		contrib(t, s, "c", "req-a", 1, cv("a", 1))
 		contrib(t, s, "c", "req-b", 1, cv("b", 2))
 		if _, err := s.Complete(context.Background(), CompleteInput{
@@ -760,6 +1251,53 @@ func TestFileRepositoryPersistenceAndOutboxFile(t *testing.T) {
 	}
 }
 
+// 替换流程的关联记录与通知同样随文件仓储持久化恢复。
+func TestFileRepositoryReplacementRecovery(t *testing.T) {
+	dir := t.TempDir()
+	clk := newFakeClock()
+
+	func() {
+		repo, err := NewFileRepository(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer repo.Close()
+		s := NewService(repo, clk.now)
+		mustCreate(t, s, "c", []string{"a", "b", "c"}, 2, clk.now().Add(24*time.Hour))
+		contrib(t, s, "c", "ra", 1, cv("a", 1))
+		nd := clk.now().Add(48 * time.Hour)
+		initiate(t, s, "c", "rep", "a", []string{"a", "c", "d"}, nd, "rotate b")
+		approve(t, s, "c", "rep", "vc", "c")
+	}()
+
+	repo2, err := NewFileRepository(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo2.Close()
+	got, err := repo2.Get(context.Background(), "c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Rounds) != 2 || !got.Rounds[1].Deadline.Equal(clk.now().Add(48*time.Hour)) {
+		t.Fatalf("rounds/deadline not recovered: %+v", got.Rounds)
+	}
+	rep := got.Replacements["rep"]
+	if rep == nil || rep.Status != ReplacementApproved ||
+		rep.PreviousRound != 1 || rep.NewRoundNumber != 2 {
+		t.Fatalf("replacement not recovered: %+v", rep)
+	}
+	if len(rep.InvalidatedContributions) != 1 ||
+		rep.InvalidatedContributions[0].ParticipantID != "a" {
+		t.Fatalf("invalidated snapshot not recovered: %+v", rep.InvalidatedContributions)
+	}
+	if len(got.Notifications) != 2 ||
+		got.Notifications[0].Type != NtfReplacementInitiated ||
+		got.Notifications[1].Type != NtfReplacementApproved {
+		t.Fatalf("notifications not recovered: %+v", got.Notifications)
+	}
+}
+
 func TestFileRepositoryNotFound(t *testing.T) {
 	dir := t.TempDir()
 	repo, err := NewFileRepository(dir)
@@ -777,7 +1315,7 @@ func TestFileRepositoryNotFound(t *testing.T) {
 	}
 }
 
-// ---- 替换/贡献/完成/取消/超时并发交织：只能得到合法演进与终态 ----
+// ---- 替换/贡献/完成/取消并发交织：只能得到合法演进与终态 ----
 
 func TestConcurrentInterleavingInvariants(t *testing.T) {
 	for _, f := range fixtures(t) {
@@ -799,7 +1337,6 @@ func TestConcurrentInterleavingInvariants(t *testing.T) {
 					go func(m string, iter int) {
 						defer wg.Done()
 						<-barrier
-						// 可能成功（首轮或替换后恰为新成员），也可能因各种合法原因失败。
 						_, _ = s.SubmitContribution(context.Background(), ContributeInput{
 							CeremonyID:   id,
 							RequestID:    fmt.Sprintf("r1-%s-%d", m, iter),
@@ -809,16 +1346,22 @@ func TestConcurrentInterleavingInvariants(t *testing.T) {
 					}(m, iter)
 				}
 
-				// 替换者：与贡献/完成/取消竞争，最多开启一轮。
+				// 替换者：threshold 2，a 发起后 b 批准，与贡献/完成/取消竞争。
 				wg.Add(1)
 				go func() {
 					defer wg.Done()
 					<-barrier
-					_, _ = s.ReplaceParticipants(context.Background(), ReplaceParticipantsInput{
-						CeremonyID: id,
-						RequestID:  fmt.Sprintf("rep-%d", iter),
-						NewMembers: []string{"a", "c", "e", "f"},
-						Reason:     "race",
+					_, _ = s.InitiateReplacement(context.Background(), InitiateReplacementInput{
+						CeremonyID:  id,
+						RequestID:   fmt.Sprintf("rep-%d", iter),
+						RequestedBy: "a",
+						NewMembers:  []string{"a", "c", "e", "f"},
+						NewDeadline: clk.now().Add(48 * time.Hour),
+						Reason:      "race",
+					})
+					_, _ = s.ApproveReplacement(context.Background(), ApprovalInput{
+						CeremonyID: id, RequestID: fmt.Sprintf("rep-%d", iter),
+						VoteRequestID: fmt.Sprintf("vote-c-%d", iter), Voter: "c",
 					})
 				}()
 
@@ -851,6 +1394,73 @@ func TestConcurrentInterleavingInvariants(t *testing.T) {
 	}
 }
 
+// 替换生效与当前轮超时并发：旧轮过期与新轮开启只能有一个结局。
+func TestConcurrentReplacementVsExpiry(t *testing.T) {
+	for _, f := range fixtures(t) {
+		t.Run(f.name, func(t *testing.T) {
+			const iterations = 60
+			for iter := 0; iter < iterations; iter++ {
+				clk := newFakeClock()
+				repo := f.new(t)
+				s := NewService(repo, clk.now)
+				id := fmt.Sprintf("c-%d", iter)
+				mustCreate(t, s, id, []string{"a", "b", "c"}, 2, clk.now().Add(time.Hour))
+
+				nd := clk.now().Add(48 * time.Hour)
+				initiate(t, s, id, "rep", "a", []string{"a", "b", "c", "d"}, nd, "x")
+
+				var wg sync.WaitGroup
+				barrier := make(chan struct{})
+
+				// 最后一票使同意达到门限。
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					<-barrier
+					_, _ = s.ApproveReplacement(context.Background(), ApprovalInput{
+						CeremonyID: id, RequestID: "rep", VoteRequestID: "vote-b", Voter: "b",
+					})
+				}()
+				// 越过旧轮截止时间并触发一次惰性过期。
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					<-barrier
+					clk.advance(2 * time.Hour)
+					_, _ = s.GetCeremony(context.Background(), id)
+				}()
+
+				close(barrier)
+				wg.Wait()
+
+				got, _ := s.GetCeremony(context.Background(), id)
+				rep := got.Replacements["rep"]
+				switch got.Status {
+				case StatusActive:
+					// 替换先生效：新轮已开启，截止时间是更晚的新值，请求 approved。
+					if got.CurrentRound().Number != 2 {
+						t.Fatalf("active but round = %d", got.CurrentRound().Number)
+					}
+					if rep.Status != ReplacementApproved {
+						t.Fatalf("active with round 2 but replacement = %s", rep.Status)
+					}
+				case StatusExpired:
+					// 过期先生效：仪式终止，待决替换在同一事务关闭，未开新轮。
+					if len(got.Rounds) != 1 {
+						t.Fatalf("expired but rounds = %d", len(got.Rounds))
+					}
+					if rep.Status != ReplacementClosed {
+						t.Fatalf("expired but replacement = %s", rep.Status)
+					}
+				default:
+					t.Fatalf("illegal status %q", got.Status)
+				}
+				assertCeremonyInvariants(t, s, id)
+			}
+		})
+	}
+}
+
 func assertCeremonyInvariants(t *testing.T, s *Service, id string) {
 	t.Helper()
 	c, err := s.GetCeremony(context.Background(), id)
@@ -858,13 +1468,16 @@ func assertCeremonyInvariants(t *testing.T, s *Service, id string) {
 		t.Fatalf("get after race: %v", err)
 	}
 
-	// 1. 轮次号从 1 严格递增，不跳号。
+	// 1. 轮次号从 1 严格递增，不跳号；截止时间均已冻结。
 	for i, r := range c.Rounds {
 		if r.Number != i+1 {
 			t.Fatalf("round numbers not contiguous: %+v", c.Rounds)
 		}
 		if r.Threshold != c.Threshold {
 			t.Fatalf("round threshold drifted: %d vs %d", r.Threshold, c.Threshold)
+		}
+		if r.Deadline.IsZero() {
+			t.Fatalf("round %d has no frozen deadline", r.Number)
 		}
 		// 2. 每个成员每轮至多一条贡献，且贡献者必须是该轮成员。
 		if len(r.Contributions) > len(r.Members) {
@@ -877,13 +1490,62 @@ func assertCeremonyInvariants(t *testing.T, s *Service, id string) {
 		}
 	}
 
+	// 3. 替换关联完整：approved 请求的新旧轮次与失效贡献快照一致。
+	for rid, rep := range c.Replacements {
+		switch rep.Status {
+		case ReplacementApproved:
+			if rep.NewRoundNumber < 1 || rep.PreviousRound != rep.NewRoundNumber-1 {
+				t.Fatalf("replacement %s round linkage broken: %+v", rid, rep)
+			}
+			if rep.NewRoundNumber > len(c.Rounds) {
+				t.Fatalf("replacement %s points beyond rounds", rid)
+			}
+			newRound := c.Rounds[rep.NewRoundNumber-1]
+			if !equalStrings(newRound.Members, rep.NewMembers) {
+				t.Fatalf("replacement %s members mismatch: %v vs %v", rid, newRound.Members, rep.NewMembers)
+			}
+			oldRound := c.Rounds[rep.PreviousRound-1]
+			if len(rep.InvalidatedContributions) != len(oldRound.Contributions) {
+				t.Fatalf("replacement %s invalidated snapshot %d != old round contributions %d",
+					rid, len(rep.InvalidatedContributions), len(oldRound.Contributions))
+			}
+			if len(rep.Approvers) < c.Threshold {
+				t.Fatalf("replacement %s approved with %d < threshold %d", rid, len(rep.Approvers), c.Threshold)
+			}
+		case ReplacementPending:
+			if c.Status != StatusActive {
+				t.Fatalf("pending replacement %s in %s ceremony", rid, c.Status)
+			}
+		}
+	}
+
+	// 4. 通知序号连续且与状态同生共死：completed/expired 之后必有对应终态通知。
+	var sawCompleted, sawExpired bool
+	for i, n := range c.Notifications {
+		if n.Seq != int64(i+1) {
+			t.Fatalf("notification seq gap: %d != %d", n.Seq, i+1)
+		}
+		switch n.Type {
+		case NtfCeremonyCompleted:
+			sawCompleted = true
+		case NtfCeremonyExpired:
+			sawExpired = true
+		}
+	}
+	if (c.Status == StatusCompleted) != sawCompleted {
+		t.Fatalf("completed state=%s but notification present=%v", c.Status, sawCompleted)
+	}
+	if (c.Status == StatusExpired) != sawExpired {
+		t.Fatalf("expired state=%s but notification present=%v", c.Status, sawExpired)
+	}
+
 	switch c.Status {
 	case StatusActive:
 		if c.Outbox != nil {
 			t.Fatal("active ceremony must not have outbox")
 		}
 	case StatusCompleted:
-		// 3. 唯一 outbox：冻结的贡献集合来自完成轮且达到门限。
+		// 5. 唯一 outbox：冻结的贡献集合来自完成轮且达到门限。
 		if c.Outbox == nil {
 			t.Fatal("completed without outbox")
 		}

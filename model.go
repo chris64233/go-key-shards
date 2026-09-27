@@ -40,12 +40,15 @@ type Round struct {
 	Number int `json:"number"`
 	// Members 创建时/替换参与者时冻结的成员集合（去重后的有序快照）。
 	Members []string `json:"members"`
-	// Threshold 该轮冻结的门限。
+	// Threshold 该轮冻结的门限（仪式级，全轮一致）。
 	Threshold int `json:"threshold"`
 	// Contributions 按参与者索引的有效贡献（同一参与者每轮至多一条）。
 	Contributions map[string]*Contribution `json:"contributions,omitempty"`
 	// StartedAt 该轮开启时间。
 	StartedAt time.Time `json:"started_at"`
+	// Deadline 该轮冻结的截止时间：第 1 轮取创建仪式时的参数，
+	// 后续轮取替换请求中携带的新截止时间。惰性过期一律以当前轮的该值为准。
+	Deadline time.Time `json:"deadline"`
 }
 
 // Outbox 是完成仪式时写出的唯一密钥激活消息。
@@ -64,19 +67,119 @@ type Outbox struct {
 	ActivatedAt time.Time `json:"activated_at"`
 }
 
+// ReplacementStatus 是一次替换请求的生命周期状态。
+type ReplacementStatus string
+
+const (
+	// ReplacementPending 等待收集门限数量的同意。
+	ReplacementPending ReplacementStatus = "pending"
+	// ReplacementApproved 同意数达到门限：新轮已在同一事务内开启，旧轮贡献已失效。
+	ReplacementApproved ReplacementStatus = "approved"
+	// ReplacementRejected 发起人撤销或人数不再可能达到门限。
+	ReplacementRejected ReplacementStatus = "rejected"
+	// ReplacementClosed 等待期间仪式进入终态（完成/取消/过期），请求作废且未开新轮。
+	ReplacementClosed ReplacementStatus = "closed"
+)
+
+// IsFinal 报告替换状态是否不可再变更。
+func (s ReplacementStatus) IsFinal() bool {
+	return s == ReplacementApproved || s == ReplacementRejected || s == ReplacementClosed
+}
+
+// Replacement 是一次“替换参与者”请求的完整记录，
+// 保留新旧轮次、批准人与失效贡献的关联，供审计与关联查询。
+type Replacement struct {
+	// ID 请求号（InitiateReplacementInput.RequestID），仪式内唯一且幂等。
+	ID string `json:"id"`
+	// Status 请求状态。
+	Status ReplacementStatus `json:"status"`
+	// RequestedBy 发起人（必须是当前轮冻结成员），其同意在发起时自动计入。
+	RequestedBy string `json:"requested_by"`
+	// Reason 替换原因。
+	Reason string `json:"reason,omitempty"`
+	// NewMembers 请求要冻结的新成员集合（去重有序快照）。
+	NewMembers []string `json:"new_members"`
+	// NewDeadline 生效时为新轮冻结的截止时间；必须晚于发起时刻。
+	NewDeadline time.Time `json:"new_deadline"`
+	// TargetRound 发起时针对的轮次；只有该轮仍是当前轮时批准才能生效。
+	TargetRound int `json:"target_round"`
+	// Approvers 已同意的成员（去重有序），含发起人。
+	Approvers []string `json:"approvers"`
+	// Rejecters 明确拒绝的成员（仅留痕，不改变计数语义）。
+	Rejecters []string `json:"rejecters,omitempty"`
+	// PreviousRound 生效时被关闭的旧轮次号；未生效为 0。
+	PreviousRound int `json:"previous_round,omitempty"`
+	// NewRoundNumber 生效时开启的新轮次号；未生效为 0。
+	NewRoundNumber int `json:"new_round_number,omitempty"`
+	// InvalidatedContributions 生效瞬间旧轮被作废的贡献（按旧轮成员顺序快照），
+	// 此后旧轮的贡献映射仍保留供审计，但门限只认新轮。
+	InvalidatedContributions []Contribution `json:"invalidated_contributions,omitempty"`
+	// CreatedAt 发起时间。
+	CreatedAt time.Time `json:"created_at"`
+	// DecidedAt 生效/拒绝/关闭时间。
+	DecidedAt time.Time `json:"decided_at,omitempty"`
+}
+
+// Notification 是与状态迁移在同一事务内保存的通知（事务性 outbox）。
+//
+// 协调层不直接投递：外部投递组件按顺序读取并负责至少一次投递，
+// 投递成功后可删除/标记。通知与它所描述的状态变更要么同时可见，要么都不可见。
+type Notification struct {
+	// Seq 仪式内单调递增的通知序号，与审计序号独立。
+	Seq int64 `json:"seq"`
+	// CeremonyID 所属仪式。
+	CeremonyID string `json:"ceremony_id"`
+	// At 生成时间（等于对应状态迁移的事务时间）。
+	At time.Time `json:"at"`
+	// Type 通知类型，见 Ntf* 常量。
+	Type string `json:"type"`
+	// ReplacementID 关联的替换请求（替换类通知）。
+	ReplacementID string `json:"replacement_id,omitempty"`
+	// RoundNumber 关联轮次。
+	RoundNumber int `json:"round_number,omitempty"`
+	// Detail 通知负载（批准人、失效贡献者、新截止时间等）。
+	Detail map[string]any `json:"detail,omitempty"`
+}
+
+// 通知类型。
+const (
+	// NtfReplacementInitiated 替换请求已发起，等待门限批准。
+	NtfReplacementInitiated = "replacement_initiated"
+	// NtfReplacementApproved 门限批准达成：新轮已开启，旧轮贡献已失效。
+	NtfReplacementApproved = "replacement_approved"
+	// NtfReplacementRejected 替换请求被拒绝/撤销。
+	NtfReplacementRejected = "replacement_rejected"
+	// NtfReplacementClosed 仪式进入终态，待决替换被关闭。
+	NtfReplacementClosed = "replacement_closed"
+	// NtfCeremonyCompleted 仪式完成，密钥激活 outbox 已冻结。
+	NtfCeremonyCompleted = "ceremony_completed"
+	// NtfCeremonyExpired 当前轮超过截止时间，仪式过期。
+	NtfCeremonyExpired = "ceremony_expired"
+)
+
 // Ceremony 是状态协调层的聚合根。
 type Ceremony struct {
 	ID string `json:"id"`
 
 	// 以下字段在创建时冻结。
 	Threshold    int       `json:"threshold"`
-	Deadline     time.Time `json:"deadline"`
 	CreatedAt    time.Time `json:"created_at"`
 	CancelReason string    `json:"cancel_reason,omitempty"`
+
+	// Deadline 第 1 轮的截止时间（创建时冻结），保留用于展示与向后兼容；
+	// 过期判断一律以当前轮的 Round.Deadline 为准（替换生效后新轮重新冻结）。
+	Deadline time.Time `json:"deadline"`
 
 	// Rounds 轮次按 Number 递增追加；最后一个为当前轮次。
 	// 旧轮次及其未决贡献在新轮开启时即告失效（不再计入当前门限）。
 	Rounds []*Round `json:"rounds"`
+
+	// Replacements 替换请求按发起顺序保存（幂等 ID 为键）；
+	// 每个 approved 请求恰好关联一对（旧轮, 新轮）与一份失效贡献快照。
+	Replacements map[string]*Replacement `json:"replacements,omitempty"`
+
+	// Notifications 事务性通知，按 Seq 有序追加。
+	Notifications []Notification `json:"notifications,omitempty"`
 
 	Status CeremonyStatus `json:"status"`
 	// Outbox 完成时写出且仅写出一次；完成后不可变。
@@ -91,10 +194,13 @@ type Ceremony struct {
 type IdemRecord struct {
 	// Fingerprint 首次提交内容（参与者+承诺+摘要 / 成员集合 / key+载荷）的指纹。
 	Fingerprint string `json:"fingerprint"`
-	// RoundNumber 首次提交时的当前轮次；贡献重放据此返回首轮结果。
-	RoundNumber int `json:"round_number"`
+	// RoundNumber 首次提交时的当前轮次；贡献重放据此返回首轮结果，
+	// 替换生效后回填为开启的新轮次号。
+	RoundNumber int `json:"round_number,omitempty"`
 	// ContributionCount 首次贡献被接受后的当前轮有效贡献数。
 	ContributionCount int `json:"contribution_count,omitempty"`
+	// ReplacementID 替换/批准请求关联的替换记录 ID。
+	ReplacementID string `json:"replacement_id,omitempty"`
 }
 
 // CurrentRound 返回仪式当前（最新）轮次。
@@ -118,11 +224,15 @@ type AuditEvent struct {
 
 // 审计事件类型。
 const (
-	AuditCreated     = "created"
-	AuditContributed = "contributed"
-	AuditRejected    = "rejected"
-	AuditReplaced    = "participants_replaced"
-	AuditCompleted   = "completed"
-	AuditCanceled    = "canceled"
-	AuditExpired     = "expired"
+	AuditCreated              = "created"
+	AuditContributed          = "contributed"
+	AuditRejected             = "rejected"
+	AuditReplacementInitiated = "replacement_initiated"
+	AuditReplacementApproval  = "replacement_approved_vote"
+	AuditReplaced             = "participants_replaced"
+	AuditReplacementWithdrawn = "replacement_withdrawn"
+	AuditReplacementClosed    = "replacement_closed"
+	AuditCompleted            = "completed"
+	AuditCanceled             = "canceled"
+	AuditExpired              = "expired"
 )
