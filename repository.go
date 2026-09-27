@@ -4,11 +4,16 @@ import (
 	"context"
 )
 
-// Repository 持久化仪式状态、密钥激活 outbox 与审计流。
+// Repository 持久化仪式状态（轮次、替换提案、批准、通知、幂等表）、
+// 密钥激活 outbox 与审计流。
 //
 // 实现必须保证：单个仪式的一次 Update 在其可见范围内串行执行
-// （内存实现用每仪式互斥量；文件实现用文件锁 + 读改写），
-// 协调层据此保证“门限达成后只有一个并发请求能完成仪式”。
+// （内存实现用每仪式互斥量；文件实现用文件锁 + 读改写 + state.json 原子替换），
+// 协调层据此保证“门限达成后只有一个并发请求能完成仪式”，以及
+// “替换生效/完成/取消/超时并发时只有一个终态”。
+//
+// 通知（Ceremony.Notifications）内嵌在仪式状态中，因此与状态迁移天然在
+// 同一次 Update/同一次 state.json 写盘事务内提交，不存在状态已变而通知丢失的中间态。
 type Repository interface {
 	// Create 以初始状态写入一个新仪式；ID 已存在时返回 ErrExists。
 	Create(ctx context.Context, c *Ceremony, events []AuditEvent) error
