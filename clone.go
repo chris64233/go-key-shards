@@ -21,6 +21,47 @@ func cloneContribution(cv *Contribution) *Contribution {
 	}
 }
 
+func cloneContributionRecord(r *ContributionRecord) *ContributionRecord {
+	if r == nil {
+		return nil
+	}
+	return &ContributionRecord{
+		Contribution: *cloneContribution(&r.Contribution),
+		Status:       r.Status,
+		WithdrawalID: r.WithdrawalID,
+		CreatedAt:    r.CreatedAt,
+		UpdatedAt:    r.UpdatedAt,
+	}
+}
+
+func cloneWithdrawal(w *Withdrawal) *Withdrawal {
+	if w == nil {
+		return nil
+	}
+	return &Withdrawal{
+		ID:                     w.ID,
+		Status:                 w.Status,
+		RoundNumber:            w.RoundNumber,
+		ParticipantID:          w.ParticipantID,
+		ShardDigest:            cloneBytes(w.ShardDigest),
+		Reason:                 w.Reason,
+		Reviewer:               w.Reviewer,
+		RequestedAt:            w.RequestedAt,
+		DecidedAt:              w.DecidedAt,
+		MissingContributors:    append([]string(nil), w.MissingContributors...),
+		ValidContributionCount: w.ValidContributionCount,
+		Threshold:              w.Threshold,
+	}
+}
+
+func cloneWithdrawals(ws []*Withdrawal) []*Withdrawal {
+	out := make([]*Withdrawal, len(ws))
+	for i, w := range ws {
+		out[i] = cloneWithdrawal(w)
+	}
+	return out
+}
+
 func cloneRound(r *Round) *Round {
 	if r == nil {
 		return nil
@@ -29,13 +70,18 @@ func cloneRound(r *Round) *Round {
 	for k, v := range r.Contributions {
 		cs[k] = cloneContribution(v)
 	}
+	records := make([]*ContributionRecord, len(r.ContributionRecords))
+	for i, v := range r.ContributionRecords {
+		records[i] = cloneContributionRecord(v)
+	}
 	return &Round{
-		Number:        r.Number,
-		Members:       append([]string(nil), r.Members...),
-		Threshold:     r.Threshold,
-		Contributions: cs,
-		StartedAt:     r.StartedAt,
-		Deadline:      r.Deadline,
+		Number:              r.Number,
+		Members:             append([]string(nil), r.Members...),
+		Threshold:           r.Threshold,
+		Contributions:       cs,
+		ContributionRecords: records,
+		StartedAt:           r.StartedAt,
+		Deadline:            r.Deadline,
 	}
 }
 
@@ -76,6 +122,7 @@ func cloneNotification(n Notification) Notification {
 		At:            n.At,
 		Type:          n.Type,
 		ReplacementID: n.ReplacementID,
+		WithdrawalID:  n.WithdrawalID,
 		RoundNumber:   n.RoundNumber,
 		Detail:        detail,
 	}
@@ -111,6 +158,10 @@ func cloneCeremony(c *Ceremony) *Ceremony {
 	for k, v := range c.Replacements {
 		reps[k] = cloneReplacement(v)
 	}
+	withdrawals := make(map[string]*Withdrawal, len(c.Withdrawals))
+	for k, v := range c.Withdrawals {
+		withdrawals[k] = cloneWithdrawal(v)
+	}
 	ntfs := make([]Notification, len(c.Notifications))
 	for i, n := range c.Notifications {
 		ntfs[i] = cloneNotification(n)
@@ -132,6 +183,7 @@ func cloneCeremony(c *Ceremony) *Ceremony {
 		CancelReason:  c.CancelReason,
 		Rounds:        rounds,
 		Replacements:  reps,
+		Withdrawals:   withdrawals,
 		Notifications: ntfs,
 		Status:        c.Status,
 		Outbox:        cloneOutbox(c.Outbox),

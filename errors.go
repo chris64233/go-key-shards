@@ -36,4 +36,13 @@ var (
 	// ErrApproverNotContinuing 批准人不在替换后的成员集合中：只有继续参与的成员
 	// （新旧成员集合的交集）才有同意权，被替换出去的人不能批准自己的替换。
 	ErrApproverNotContinuing = errors.New("keyshards: approver is not a continuing participant")
+
+	// ErrContributionReviewPending 贡献正处于撤回待审核，暂时不能再次提交或被完成采用。
+	ErrContributionReviewPending = errors.New("keyshards: contribution withdrawal is pending review")
+	// ErrWithdrawalNotFound 撤回申请不存在。
+	ErrWithdrawalNotFound = errors.New("keyshards: contribution withdrawal not found")
+	// ErrWithdrawalFinal 撤回申请已有最终审核结果或已关闭。
+	ErrWithdrawalFinal = errors.New("keyshards: contribution withdrawal already finalized")
+	// ErrReviewerMismatch 审核人与撤回申请固定的审核人不一致。
+	ErrReviewerMismatch = errors.New("keyshards: withdrawal reviewer mismatch")
 )

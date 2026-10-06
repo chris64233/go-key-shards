@@ -38,6 +38,28 @@
 即使重试发生在轮次替换、截止过期或仪式完成之后，同号同内容的重试仍返回首次结果，
 而复用请求号提交不同内容（或改投其他轮次）一律判为冲突。
 
+### 贡献撤回审核
+
+外部密码学组件确认某份贡献不应继续采用时，协调层通过
+`RequestContributionWithdrawal` 发起固定上下文的撤回申请：仪式、当前轮次、
+参与者、贡献摘要、原因与审核人在首次提交时锁定。已完成、取消或过期仪式中的
+贡献不能撤回；针对旧轮次的申请继续按既有旧轮次规则拒绝。
+
+- 申请提交后，该贡献从当前有效集合移到 `review_pending`，立即停止计入完成门限；
+  审核期间同一参与者不能补交，完成也不能采用它。
+- 固定审核人通过 `ReviewContributionWithdrawal` 决定结果。拒绝时贡献恢复为
+  `valid`；通过时贡献变为不可变的 `withdrawn`，并保留申请、审核结果与审计时间线。
+- 撤回通过导致有效贡献不足时，仪式仍停留在当前轮的活跃状态，等待补交；
+  返回结果和 `GetCurrentRoundState` 会列出缺少有效贡献的成员。补齐同一轮缺口后
+  才能完成，协调层不会自动创建无关新轮次。
+- 撤回号幂等：同号且轮次、参与者、摘要、原因、审核人完全一致时返回首次结果；
+  任一关键字段变化返回 `ErrConflict`。
+- 撤回审核、补交贡献、参与者替换和完成都在单仪式串行事务内竞争。完成先生效时，
+  未决撤回关闭且贡献不会进入 outbox；替换先生效时开启既有规则的新轮，旧轮未决
+  撤回关闭，新轮仍需重新收集门限贡献。
+- `GetCurrentRoundState` 区分 `valid`、`review_pending`、`withdrawn`（以及终态
+  竞争导致的 `closed`）记录；`GetWithdrawal` / `ListWithdrawals` 返回审核时间线。
+
 ## 完成前替换参与者：门限批准 + 显式新一轮
 
 替换无法继续参与的人是一个两步流程，而不是直接改一个人员字段：
@@ -137,9 +159,21 @@ rep, _ = svc.ApproveReplacement(ctx, keyshards.ApprovalInput{
     VoteRequestID: "vote-carol-1", Voter: "carol",
 })
 
+// 外部密码学组件确认贡献不得采用：提交后立即停止计门限，等待固定审核人决定
+wd, _ := svc.RequestContributionWithdrawal(ctx, keyshards.RequestContributionWithdrawalInput{
+    CeremonyID: "cer-1", RequestID: "withdraw-bob-1", RoundNumber: rep.NewRoundNumber,
+    ParticipantID: "bob", ShardDigest: cryptoOut.BadShardDigest,
+    Reason: "external cryptographic validation failed", Reviewer: "auditor-1",
+})
+wd, _ = svc.ReviewContributionWithdrawal(ctx, keyshards.ReviewContributionWithdrawalInput{
+    CeremonyID: "cer-1", RequestID: wd.ID, Reviewer: "auditor-1", Approve: true,
+})
+state, _ := svc.GetCurrentRoundState(ctx, "cer-1") // state.MissingContributors 列出待补交缺口
+
 // 关联查询：新旧轮次、批准人、失效贡献快照
 rep, _ = svc.GetReplacement(ctx, "cer-1", "rotate-bob-1")
 all, _ := svc.ListReplacements(ctx, "cer-1")
+wd, _ = svc.GetWithdrawal(ctx, "cer-1", "withdraw-bob-1")
 notifications, _ := svc.Notifications(ctx, "cer-1", 0 /*fromSeq*/, 0 /*limit*/)
 
 // 新轮重新收集到门限后完成：冻结采用集合（属于新轮），写出唯一 outbox
@@ -159,7 +193,7 @@ events, _ := svc.Audit(ctx, "cer-1", 0 /*fromSeq*/, 0 /*limit*/)
 
 - `MemRepository`：进程内实现，每仪式一把互斥量，适合测试与单进程部署。
 - `FileRepository`：JSON 文件持久化，目录布局：
-  - `state.json`：全部仪式状态（含轮次、替换记录、通知）与审计事件
+  - `state.json`：全部仪式状态（含轮次、替换记录、撤回审核记录、通知）与审计事件
     （临时文件 + fsync + rename 原子替换）；
   - `lock`：`flock(2)` 文件锁，提供跨进程互斥（Windows 为进程内锁占位）；
   - `outbox/<ceremony-id>.json`：完成时写出且**只写一次**的密钥激活消息，
@@ -167,13 +201,15 @@ events, _ := svc.Audit(ctx, "cer-1", 0 /*fromSeq*/, 0 /*limit*/)
 
 写盘顺序是“先 outbox、后状态”：若两步之间崩溃，状态仍为 `active`，
 重试完成会以相同文件名覆盖重写，不会产生第二条激活消息。
-替换记录、失效贡献快照与通知都在 `state.json` 内，与仪式状态原子同存。
+替换记录、撤回审核记录、失效贡献快照与通知都在 `state.json` 内，与仪式状态原子同存。
 
 ### 审计
 
-所有状态迁移（created / contributed / replacement_initiated /
-replacement_approved_vote / participants_replaced / replacement_withdrawn /
-replacement_closed / completed / canceled / expired）以及被拒绝的操作
+所有状态迁移（created / contributed / contribution_withdrawal_requested /
+contribution_withdrawal_approved / contribution_withdrawal_rejected /
+contribution_withdrawal_closed / replacement_initiated / replacement_approved_vote /
+participants_replaced / replacement_withdrawn / replacement_closed / completed /
+canceled / expired）以及被拒绝的操作
 （rejected，含原因）都写入按仪式单调递增的事件流；贡献事件只记录承诺与
 分片摘要的十六进制编码，没有任何明文字段。
 
