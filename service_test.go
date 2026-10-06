@@ -1573,6 +1573,229 @@ func assertCeremonyInvariants(t *testing.T, s *Service, id string) {
 	}
 }
 
+// ---- 贡献撤回审核 ----
+
+func requestWithdrawal(t *testing.T, s *Service, id, reqID string, round int, participant string, digest []byte, reason, reviewer string) *ContributionWithdrawal {
+	t.Helper()
+	w, err := s.RequestContributionWithdrawal(context.Background(), WithdrawContributionInput{
+		CeremonyID:         id,
+		RequestID:          reqID,
+		RoundNumber:        round,
+		ParticipantID:      participant,
+		ContributionDigest: digest,
+		Reason:             reason,
+		Reviewer:           reviewer,
+	})
+	if err != nil {
+		t.Fatalf("RequestContributionWithdrawal(%s): %v", reqID, err)
+	}
+	return w
+}
+
+func reviewWithdrawal(t *testing.T, s *Service, id, withdrawalID, decisionID, reviewer string, approve bool) *ContributionWithdrawal {
+	t.Helper()
+	w, err := s.ReviewContributionWithdrawal(context.Background(), ReviewContributionWithdrawalInput{
+		CeremonyID:   id,
+		WithdrawalID: withdrawalID,
+		RequestID:    decisionID,
+		Reviewer:     reviewer,
+		Approve:      approve,
+	})
+	if err != nil {
+		t.Fatalf("ReviewContributionWithdrawal(%s): %v", withdrawalID, err)
+	}
+	return w
+}
+
+func TestContributionWithdrawalReviewLifecycleAndThresholdRecovery(t *testing.T) {
+	for _, f := range fixtures(t) {
+		t.Run(f.name, func(t *testing.T) {
+			clk := newFakeClock()
+			s := NewService(f.new(t), clk.now)
+			mustCreate(t, s, "c", []string{"a", "b", "c"}, 2, clk.now().Add(time.Hour))
+			first := cv("a", 1)
+			second := cv("b", 2)
+			contrib(t, s, "c", "req-a", 1, first)
+			contrib(t, s, "c", "req-b", 1, second)
+
+			// 第二个仪式覆盖申请、拒绝、再申请、通过、补交、完成的完整时间线。
+			mustCreate(t, s, "c2", []string{"a", "b", "c"}, 2, clk.now().Add(time.Hour))
+			contrib(t, s, "c2", "req-a2", 1, first)
+			contrib(t, s, "c2", "req-b2", 1, second)
+
+			w := requestWithdrawal(t, s, "c2", "wd-a", 1, "a", first.ShardDigest, "crypto invalid", "auditor")
+			if w.Status != WithdrawalPending {
+				t.Fatalf("withdrawal status = %s", w.Status)
+			}
+			status, reviews, err := s.GetRoundContributionStatus(context.Background(), "c2", 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if status.ValidCount != 1 || status.PendingReviewCount != 1 || !equalStrings(status.MissingParticipants, []string{"a", "c"}) {
+				t.Fatalf("pending status = %+v", status)
+			}
+			if got := reviews[0].Status; got != ContributionReviewPending {
+				t.Fatalf("review status = %s", got)
+			}
+			if _, err := s.Complete(context.Background(), CompleteInput{CeremonyID: "c2", RequestID: "blocked", KeyID: "k"}); !errIs(err, ErrThresholdNotReached) {
+				t.Fatalf("complete during review err = %v", err)
+			}
+
+			// 审核拒绝：恢复有效；重放审核请求返回原结果。
+			reviewWithdrawal(t, s, "c2", "wd-a", "dec-reject", "auditor", false)
+			replayedReject := reviewWithdrawal(t, s, "c2", "wd-a", "dec-reject", "auditor", false)
+			if replayedReject.Status != WithdrawalRejected {
+				t.Fatalf("replayed rejection = %s", replayedReject.Status)
+			}
+			status, _, _ = s.GetRoundContributionStatus(context.Background(), "c2", 1)
+			if status.ValidCount != 2 || !equalStrings(status.MissingParticipants, []string{"c"}) {
+				t.Fatalf("after reject status = %+v", status)
+			}
+
+			// 再次申请并通过：原贡献不可采用，同一参与者补交后恢复门限。
+			w = requestWithdrawal(t, s, "c2", "wd-a-2", 1, "a", first.ShardDigest, "still invalid", "auditor")
+			reviewWithdrawal(t, s, "c2", w.ID, "dec-approve", "auditor", true)
+			if _, err := s.Complete(context.Background(), CompleteInput{CeremonyID: "c2", RequestID: "blocked-2", KeyID: "k"}); !errIs(err, ErrThresholdNotReached) {
+				t.Fatalf("complete after withdrawal err = %v", err)
+			}
+			status, reviews, _ = s.GetRoundContributionStatus(context.Background(), "c2", 1)
+			if status.ValidCount != 1 || status.WithdrawnCount != 1 || !equalStrings(status.MissingParticipants, []string{"a", "c"}) {
+				t.Fatalf("after approval status = %+v", status)
+			}
+			if reviews[0].Withdrawal == nil || reviews[0].Withdrawal.Status != WithdrawalApproved {
+				t.Fatalf("withdrawal timeline missing: %+v", reviews[0])
+			}
+
+			replacement := cv("a", 3)
+			contrib(t, s, "c2", "req-a-fixed", 1, replacement)
+			ob, err := s.Complete(context.Background(), CompleteInput{CeremonyID: "c2", RequestID: "done", KeyID: "k", Payload: []byte("payload")})
+			if err != nil {
+				t.Fatalf("complete after supplemental contribution: %v", err)
+			}
+			if ids := participantIDs(ob.Contributions); !equalStrings(ids, []string{"a", "b"}) {
+				t.Fatalf("adopted = %v", ids)
+			}
+			if !bytes.Equal(ob.Contributions[0].ShardDigest, replacement.ShardDigest) {
+				t.Fatal("completed outbox adopted withdrawn contribution")
+			}
+
+			// 已完成仪式中的贡献不能再撤回。
+			_, err = s.RequestContributionWithdrawal(context.Background(), WithdrawContributionInput{
+				CeremonyID: "c2", RequestID: "late", RoundNumber: 1, ParticipantID: "b",
+				ContributionDigest: second.ShardDigest, Reason: "late", Reviewer: "auditor",
+			})
+			if !errIs(err, ErrCeremonyTerminal) {
+				t.Fatalf("withdraw completed contribution err = %v", err)
+			}
+		})
+	}
+}
+
+func TestContributionWithdrawalIdempotencyConflictAndStaleRound(t *testing.T) {
+	clk := newFakeClock()
+	s := NewService(NewMemRepository(), clk.now)
+	mustCreate(t, s, "c", []string{"a", "b", "c"}, 1, clk.now().Add(24*time.Hour))
+	first := cv("a", 1)
+	contrib(t, s, "c", "req-a", 1, first)
+	contrib(t, s, "c", "req-b", 1, cv("b", 2))
+
+	requestWithdrawal(t, s, "c", "wd", 1, "a", first.ShardDigest, "reason", "auditor")
+	replayed := requestWithdrawal(t, s, "c", "wd", 1, "a", first.ShardDigest, "reason", "auditor")
+	if replayed.Status != WithdrawalPending {
+		t.Fatalf("replay status = %s", replayed.Status)
+	}
+	cases := []WithdrawContributionInput{
+		{CeremonyID: "c", RequestID: "wd", RoundNumber: 2, ParticipantID: "a", ContributionDigest: first.ShardDigest, Reason: "reason", Reviewer: "auditor"},
+		{CeremonyID: "c", RequestID: "wd", RoundNumber: 1, ParticipantID: "b", ContributionDigest: first.ShardDigest, Reason: "reason", Reviewer: "auditor"},
+		{CeremonyID: "c", RequestID: "wd", RoundNumber: 1, ParticipantID: "a", ContributionDigest: []byte{0x99}, Reason: "reason", Reviewer: "auditor"},
+		{CeremonyID: "c", RequestID: "wd", RoundNumber: 1, ParticipantID: "a", ContributionDigest: first.ShardDigest, Reason: "other", Reviewer: "auditor"},
+		{CeremonyID: "c", RequestID: "wd", RoundNumber: 1, ParticipantID: "a", ContributionDigest: first.ShardDigest, Reason: "reason", Reviewer: "other"},
+	}
+	for i, in := range cases {
+		if _, err := s.RequestContributionWithdrawal(context.Background(), in); !errIs(err, ErrConflict) {
+			t.Fatalf("case %d err = %v, want conflict", i, err)
+		}
+	}
+
+	initiate(t, s, "c", "rep", "b", []string{"a", "b", "c", "d"}, clk.now().Add(48*time.Hour), "add d")
+	got, _ := s.GetCeremony(context.Background(), "c")
+	if got.CurrentRound().Number != 2 {
+		t.Fatalf("current round = %d", got.CurrentRound().Number)
+	}
+	if got.ContributionWithdrawals["wd"].Status != WithdrawalClosed {
+		t.Fatalf("old pending withdrawal = %s", got.ContributionWithdrawals["wd"].Status)
+	}
+	_, err := s.RequestContributionWithdrawal(context.Background(), WithdrawContributionInput{
+		CeremonyID: "c", RequestID: "old-round", RoundNumber: 1, ParticipantID: "a",
+		ContributionDigest: first.ShardDigest, Reason: "late", Reviewer: "auditor",
+	})
+	if !errIs(err, ErrStaleRound) {
+		t.Fatalf("old round withdrawal err = %v", err)
+	}
+}
+
+func TestConcurrentWithdrawalDecisionSupplementAndComplete(t *testing.T) {
+	for _, f := range fixtures(t) {
+		t.Run(f.name, func(t *testing.T) {
+			for iter := 0; iter < 60; iter++ {
+				clk := newFakeClock()
+				s := NewService(f.new(t), clk.now)
+				id := fmt.Sprintf("c-%d", iter)
+				mustCreate(t, s, id, []string{"a", "b"}, 2, clk.now().Add(time.Hour))
+				first := cv("a", 1)
+				contrib(t, s, id, "req-a", 1, first)
+				contrib(t, s, id, "req-b", 1, cv("b", 2))
+				requestWithdrawal(t, s, id, "wd-a", 1, "a", first.ShardDigest, "bad", "auditor")
+
+				var wg sync.WaitGroup
+				barrier := make(chan struct{})
+				wg.Add(3)
+				go func() {
+					defer wg.Done()
+					<-barrier
+					_, _ = s.ReviewContributionWithdrawal(context.Background(), ReviewContributionWithdrawalInput{
+						CeremonyID: id, WithdrawalID: "wd-a", RequestID: "decide", Reviewer: "auditor", Approve: true,
+					})
+				}()
+				go func() {
+					defer wg.Done()
+					<-barrier
+					_, _ = s.SubmitContribution(context.Background(), ContributeInput{
+						CeremonyID: id, RequestID: "req-a-fixed", RoundNumber: 1, Contribution: cv("a", 9),
+					})
+				}()
+				go func() {
+					defer wg.Done()
+					<-barrier
+					_, _ = s.Complete(context.Background(), CompleteInput{CeremonyID: id, RequestID: "finish", KeyID: "k"})
+				}()
+				close(barrier)
+				wg.Wait()
+
+				got, _ := s.GetCeremony(context.Background(), id)
+				if got.Status == StatusCompleted {
+					if got.Outbox == nil || len(got.Outbox.Contributions) != 2 {
+						t.Fatalf("completed outbox = %+v", got.Outbox)
+					}
+					for _, adopted := range got.Outbox.Contributions {
+						if adopted.ParticipantID == "a" && bytes.Equal(adopted.ShardDigest, first.ShardDigest) {
+							t.Fatal("complete adopted reviewed/withdrawn contribution")
+						}
+					}
+				} else {
+					status, _, err := s.GetRoundContributionStatus(context.Background(), id, 1)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if status.ValidCount < 2 && got.Status != StatusActive {
+						t.Fatalf("noncompleted status = %s, count = %d", got.Status, status.ValidCount)
+					}
+				}
+			}
+		})
+	}
+}
+
 // ---- 辅助 ----
 
 func equalStrings(a, b []string) bool {

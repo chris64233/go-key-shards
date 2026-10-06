@@ -1,9 +1,11 @@
 package keyshards
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"sort"
 	"time"
 )
@@ -53,14 +55,15 @@ func (s *Service) CreateCeremony(ctx context.Context, in CreateInput) (*Ceremony
 	now := s.now()
 	deadline := in.Deadline.UTC()
 	c := &Ceremony{
-		ID:           in.ID,
-		Threshold:    in.Threshold,
-		Deadline:     deadline,
-		CreatedAt:    now,
-		Status:       StatusActive,
-		Rounds:       []*Round{newRound(1, members, in.Threshold, now, deadline)},
-		Replacements: map[string]*Replacement{},
-		Idempotency:  map[string]*IdemRecord{},
+		ID:                      in.ID,
+		Threshold:               in.Threshold,
+		Deadline:                deadline,
+		CreatedAt:               now,
+		Status:                  StatusActive,
+		Rounds:                  []*Round{newRound(1, members, in.Threshold, now, deadline)},
+		Replacements:            map[string]*Replacement{},
+		ContributionWithdrawals: map[string]*ContributionWithdrawal{},
+		Idempotency:             map[string]*IdemRecord{},
 	}
 	ev := AuditEvent{
 		At:          now,
@@ -155,12 +158,23 @@ func (s *Service) SubmitContribution(ctx context.Context, in ContributeInput) (*
 			return nil, evs, errReject
 		}
 		if _, dup := r.Contributions[in.Contribution.ParticipantID]; dup {
-			evs, errReject := s.reject(c, r, now, in.Contribution.ParticipantID, "duplicate_contribution",
-				ErrAlreadyContributed, nil)
-			return nil, evs, errReject
+			if existing := r.Contributions[in.Contribution.ParticipantID]; existing != nil && existing.Status == ContributionReviewPending {
+				evs, errReject := s.reject(c, r, now, in.Contribution.ParticipantID, "withdrawal_review_pending",
+					ErrWithdrawalPending, nil)
+				return nil, evs, errReject
+			}
+			if existing := r.Contributions[in.Contribution.ParticipantID]; existing != nil && existing.Status == ContributionWithdrawn {
+				delete(r.Contributions, in.Contribution.ParticipantID)
+			} else {
+				evs, errReject := s.reject(c, r, now, in.Contribution.ParticipantID, "duplicate_contribution",
+					ErrAlreadyContributed, nil)
+				return nil, evs, errReject
+			}
 		}
 
 		cv := cloneContribution(&in.Contribution)
+		cv.Status = ContributionValid
+		cv.WithdrawalID = ""
 		r.Contributions[cv.ParticipantID] = cv
 		c.Idempotency[idempKey] = &IdemRecord{
 			Fingerprint:       fp,
@@ -178,13 +192,13 @@ func (s *Service) SubmitContribution(ctx context.Context, in ContributeInput) (*
 				"request_id":         in.RequestID,
 				"commitment":         hex.EncodeToString(cv.Commitment),
 				"shard_digest":       hex.EncodeToString(cv.ShardDigest),
-				"contribution_count": len(r.Contributions),
+				"contribution_count": validContributionCount(r),
 				"threshold":          c.Threshold,
 			},
 		}}
 		result = &ContributeResult{
 			RoundNumber:       r.Number,
-			ContributionCount: len(r.Contributions),
+			ContributionCount: validContributionCount(r),
 			Threshold:         c.Threshold,
 		}
 		return c, events, nil
@@ -193,6 +207,213 @@ func (s *Service) SubmitContribution(ctx context.Context, in ContributeInput) (*
 		return nil, err
 	}
 	return result, nil
+}
+
+// WithdrawContributionInput 申请对一份有效贡献进行撤回审核。
+type WithdrawContributionInput struct {
+	CeremonyID string
+	// RequestID 撤回请求号；同号同内容重放返回原审核记录。
+	RequestID     string
+	RoundNumber   int
+	ParticipantID string
+	// ContributionDigest 必须与目标贡献的 ShardDigest 完全一致。
+	ContributionDigest []byte
+	Reason             string
+	Reviewer           string
+}
+
+// RequestContributionWithdrawal 固定仪式、轮次、参与者、贡献摘要、原因和审核人，
+// 并把目标贡献暂时移出有效门限计数。只有当前轮中的有效贡献可以申请。
+func (s *Service) RequestContributionWithdrawal(ctx context.Context, in WithdrawContributionInput) (*ContributionWithdrawal, error) {
+	if in.CeremonyID == "" || in.RequestID == "" {
+		return nil, errInvalid("ceremony id and request id are required")
+	}
+	if in.RoundNumber < 1 {
+		return nil, errInvalid("round number is required")
+	}
+	if in.ParticipantID == "" || in.Reviewer == "" || in.Reason == "" || len(in.ContributionDigest) == 0 {
+		return nil, errInvalid("participant id, contribution digest, reason and reviewer are required")
+	}
+	idempKey := idemWithdrawalPrefix + in.RequestID
+	digest := append([]byte(nil), in.ContributionDigest...)
+	fp := withdrawalFingerprint(in.RoundNumber, in.ParticipantID, digest, in.Reason, in.Reviewer)
+
+	var withdrawal *ContributionWithdrawal
+	err := s.repo.Update(ctx, in.CeremonyID, func(c *Ceremony) (*Ceremony, []AuditEvent, error) {
+		now := s.now()
+		if rec, ok := c.Idempotency[idempKey]; ok {
+			if rec.Fingerprint != fp {
+				return nil, nil, ErrConflict
+			}
+			existing := c.ContributionWithdrawals[in.RequestID]
+			if existing == nil {
+				return nil, nil, ErrConflict
+			}
+			withdrawal = cloneWithdrawal(existing)
+			return c, nil, nil
+		}
+
+		expired, events, err := expireIfDue(c, now)
+		if err != nil {
+			return nil, nil, err
+		}
+		if expired {
+			return c, events, ErrDeadlineExceeded
+		}
+		r := c.CurrentRound()
+		if in.RoundNumber != r.Number {
+			evs, errReject := s.reject(c, r, now, in.ParticipantID, "stale_round", ErrStaleRound,
+				map[string]any{"requested_round": in.RoundNumber, "current_round": r.Number})
+			return nil, evs, errReject
+		}
+		cv := r.Contributions[in.ParticipantID]
+		if cv == nil || contributionStatus(cv) != ContributionValid || !bytesEqual(cv.ShardDigest, digest) {
+			return nil, events, ErrContributionNotValid
+		}
+
+		cv.Status = ContributionReviewPending
+		cv.WithdrawalID = in.RequestID
+		snapshot := cloneContribution(cv)
+		snapshot.Status = ContributionValid
+		snapshot.WithdrawalID = ""
+		req := &ContributionWithdrawal{
+			ID:                 in.RequestID,
+			Status:             WithdrawalPending,
+			RoundNumber:        r.Number,
+			ParticipantID:      in.ParticipantID,
+			ContributionDigest: cloneBytes(digest),
+			Contribution:       *snapshot,
+			Reason:             in.Reason,
+			Reviewer:           in.Reviewer,
+			RequestedAt:        now,
+		}
+		c.ContributionWithdrawals[in.RequestID] = req
+		c.Idempotency[idempKey] = &IdemRecord{Fingerprint: fp, RoundNumber: r.Number, WithdrawalID: in.RequestID}
+
+		detail := map[string]any{
+			"request_id":               in.RequestID,
+			"participant_id":           in.ParticipantID,
+			"shard_digest":             hex.EncodeToString(digest),
+			"reviewer":                 in.Reviewer,
+			"reason":                   in.Reason,
+			"valid_contribution_count": validContributionCount(r),
+		}
+		events = append(events, AuditEvent{
+			At: now, CeremonyID: c.ID, RoundNumber: r.Number,
+			Kind: AuditWithdrawalRequested, Actor: in.Reviewer, Detail: detail,
+		})
+		addNotification(c, Notification{
+			At: now, CeremonyID: c.ID, Type: NtfContributionWithdrawalRequested,
+			RoundNumber: r.Number, WithdrawalID: in.RequestID, Detail: detail,
+		})
+		withdrawal = cloneWithdrawal(req)
+		return c, events, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return withdrawal, nil
+}
+
+// ReviewContributionWithdrawalInput 是固定审核人对撤回申请的决定。
+type ReviewContributionWithdrawalInput struct {
+	CeremonyID   string
+	WithdrawalID string
+	// RequestID 本次审核动作自身的幂等请求号。
+	RequestID string
+	Reviewer  string
+	Approve   bool
+}
+
+// ReviewContributionWithdrawal 审核贡献撤回。拒绝时贡献恢复有效；通过时贡献永久撤出，
+// 审核记录不可变。若有效贡献因此低于门限，仪式仍保持 active 并等待补交。
+func (s *Service) ReviewContributionWithdrawal(ctx context.Context, in ReviewContributionWithdrawalInput) (*ContributionWithdrawal, error) {
+	if in.CeremonyID == "" || in.WithdrawalID == "" || in.RequestID == "" || in.Reviewer == "" {
+		return nil, errInvalid("ceremony id, withdrawal id, request id and reviewer are required")
+	}
+	idempKey := idemWithdrawalDecisionPrefix + in.RequestID
+	fp := withdrawalDecisionFingerprint(in.WithdrawalID, in.Reviewer, in.Approve)
+
+	var withdrawal *ContributionWithdrawal
+	err := s.repo.Update(ctx, in.CeremonyID, func(c *Ceremony) (*Ceremony, []AuditEvent, error) {
+		now := s.now()
+		if rec, ok := c.Idempotency[idempKey]; ok {
+			if rec.Fingerprint != fp {
+				return nil, nil, ErrConflict
+			}
+			existing := c.ContributionWithdrawals[rec.WithdrawalID]
+			if existing == nil || existing.ID != in.WithdrawalID {
+				return nil, nil, ErrConflict
+			}
+			withdrawal = cloneWithdrawal(existing)
+			return c, nil, nil
+		}
+
+		expired, events, err := expireIfDue(c, now)
+		if err != nil {
+			return nil, nil, err
+		}
+		if expired {
+			return c, events, ErrDeadlineExceeded
+		}
+		req := c.ContributionWithdrawals[in.WithdrawalID]
+		if req == nil {
+			return nil, events, ErrWithdrawalNotFound
+		}
+		r := c.CurrentRound()
+		if req.Status != WithdrawalPending || req.RoundNumber != r.Number {
+			if req.Status == WithdrawalPending {
+				events = append(events, closePendingWithdrawals(c, now, "superseded", req.ID)...)
+				return c, events, ErrWithdrawalFinal
+			}
+			return nil, events, ErrWithdrawalFinal
+		}
+		if req.Reviewer != in.Reviewer {
+			return nil, events, ErrReviewerMismatch
+		}
+
+		cv := r.Contributions[req.ParticipantID]
+		if cv == nil || cv.Status != ContributionReviewPending || !bytesEqual(cv.ShardDigest, req.ContributionDigest) {
+			events = append(events, closePendingWithdrawals(c, now, "contribution_missing", req.ID)...)
+			return c, events, ErrContributionNotValid
+		}
+
+		req.DecidedAt = now
+		kind := AuditWithdrawalRejected
+		notificationType := NtfContributionWithdrawalRejected
+		if in.Approve {
+			req.Status = WithdrawalApproved
+			cv.Status = ContributionWithdrawn
+			kind = AuditWithdrawalApproved
+			notificationType = NtfContributionWithdrawalApproved
+		} else {
+			req.Status = WithdrawalRejected
+			cv.Status = ContributionValid
+		}
+		c.Idempotency[idempKey] = &IdemRecord{Fingerprint: fp, RoundNumber: r.Number, WithdrawalID: req.ID}
+
+		detail := map[string]any{
+			"request_id":               req.ID,
+			"participant_id":           req.ParticipantID,
+			"reviewer":                 in.Reviewer,
+			"approved":                 in.Approve,
+			"valid_contribution_count": validContributionCount(r),
+		}
+		events = append(events, AuditEvent{
+			At: now, CeremonyID: c.ID, RoundNumber: r.Number,
+			Kind: kind, Actor: in.Reviewer, Detail: detail,
+		})
+		addNotification(c, Notification{
+			At: now, CeremonyID: c.ID, Type: notificationType,
+			RoundNumber: r.Number, WithdrawalID: req.ID, Detail: detail,
+		})
+		withdrawal = cloneWithdrawal(req)
+		return c, events, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return withdrawal, nil
 }
 
 // InitiateReplacementInput 发起一次参与者替换。
@@ -551,11 +772,12 @@ func (s *Service) Complete(ctx context.Context, in CompleteInput) (*Outbox, erro
 		}
 
 		r := c.CurrentRound()
-		if len(r.Contributions) < c.Threshold {
+		if validContributionCount(r) < c.Threshold {
 			return nil, nil, ErrThresholdNotReached
 		}
 
 		adopted := contributionsInMemberOrder(r)
+		events = closePendingWithdrawals(c, now, "ceremony_completed", "")
 		ob := &Outbox{
 			CeremonyID:    c.ID,
 			RoundNumber:   r.Number,
@@ -612,6 +834,7 @@ func (s *Service) Cancel(ctx context.Context, ceremonyID, reason string) error {
 		}
 		c.Status = StatusCanceled
 		c.CancelReason = reason
+		events = append(events, closePendingWithdrawals(c, now, "ceremony_canceled", "")...)
 		events = append(events, closePendingReplacements(c, now, "ceremony_canceled", "")...)
 		events = append(events, AuditEvent{
 			At:          now,
@@ -695,6 +918,108 @@ func (s *Service) ListReplacements(ctx context.Context, ceremonyID string) ([]*R
 	return out, nil
 }
 
+// GetContributionWithdrawal 返回一份贡献撤回审核记录。
+func (s *Service) GetContributionWithdrawal(ctx context.Context, ceremonyID, withdrawalID string) (*ContributionWithdrawal, error) {
+	if ceremonyID == "" || withdrawalID == "" {
+		return nil, errInvalid("ceremony id and withdrawal id are required")
+	}
+	c, err := s.repo.Get(ctx, ceremonyID)
+	if err != nil {
+		return nil, err
+	}
+	w := c.ContributionWithdrawals[withdrawalID]
+	if w == nil {
+		return nil, ErrWithdrawalNotFound
+	}
+	return cloneWithdrawal(w), nil
+}
+
+// ListContributionWithdrawals 按申请顺序列出全部贡献撤回审核记录。
+func (s *Service) ListContributionWithdrawals(ctx context.Context, ceremonyID string) ([]*ContributionWithdrawal, error) {
+	if ceremonyID == "" {
+		return nil, errInvalid("ceremony id is required")
+	}
+	c, err := s.repo.Get(ctx, ceremonyID)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]*ContributionWithdrawal, 0, len(c.ContributionWithdrawals))
+	for _, w := range c.ContributionWithdrawals {
+		out = append(out, w)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if !out[i].RequestedAt.Equal(out[j].RequestedAt) {
+			return out[i].RequestedAt.Before(out[j].RequestedAt)
+		}
+		return out[i].ID < out[j].ID
+	})
+	for i := range out {
+		out[i] = cloneWithdrawal(out[i])
+	}
+	return out, nil
+}
+
+// GetRoundContributionStatus 汇总当前轮或指定轮的有效、待审核、已撤回贡献和缺口。
+func (s *Service) GetRoundContributionStatus(ctx context.Context, ceremonyID string, roundNumber int) (*RoundContributionStatus, []ContributionReview, error) {
+	if ceremonyID == "" {
+		return nil, nil, errInvalid("ceremony id is required")
+	}
+	c, err := s.repo.Get(ctx, ceremonyID)
+	if err != nil {
+		return nil, nil, err
+	}
+	var r *Round
+	if roundNumber <= 0 {
+		r = c.CurrentRound()
+	} else {
+		for _, candidate := range c.Rounds {
+			if candidate.Number == roundNumber {
+				r = candidate
+				break
+			}
+		}
+	}
+	if r == nil {
+		return nil, nil, ErrStaleRound
+	}
+
+	reviews := make([]ContributionReview, 0, len(r.Contributions))
+	status := &RoundContributionStatus{
+		RoundNumber:         r.Number,
+		Threshold:           r.Threshold,
+		MissingParticipants: []string{},
+	}
+	for _, member := range r.Members {
+		cv := r.Contributions[member]
+		if cv == nil || contributionStatus(cv) != ContributionValid {
+			status.MissingParticipants = append(status.MissingParticipants, member)
+		}
+		if cv == nil {
+			continue
+		}
+		cs := contributionStatus(cv)
+		switch cs {
+		case ContributionValid:
+			status.ValidCount++
+		case ContributionReviewPending:
+			status.PendingReviewCount++
+		case ContributionWithdrawn:
+			status.WithdrawnCount++
+		}
+		review := ContributionReview{
+			RoundNumber:  r.Number,
+			Contribution: *cloneContribution(cv),
+			Status:       cs,
+		}
+		review.Contribution.Status = cs
+		if cv.WithdrawalID != "" {
+			review.Withdrawal = cloneWithdrawal(c.ContributionWithdrawals[cv.WithdrawalID])
+		}
+		reviews = append(reviews, review)
+	}
+	return status, reviews, nil
+}
+
 // Notifications 返回与状态迁移同事务保存的通知（seq 从 fromSeq 之后开始，
 // 0 表示从头；limit <= 0 表示不限），供外部投递组件按序消费。
 func (s *Service) Notifications(ctx context.Context, ceremonyID string, fromSeq int64, limit int) ([]Notification, error) {
@@ -721,10 +1046,12 @@ func (s *Service) Notifications(ctx context.Context, ceremonyID string, fromSeq 
 // ---- 内部辅助 ----
 
 const (
-	idemContributionPrefix = "contrib:"
-	idemReplacePrefix      = "replace:"
-	idemApprovalPrefix     = "approve:"
-	idemCompletePrefix     = "complete:"
+	idemContributionPrefix       = "contrib:"
+	idemReplacePrefix            = "replace:"
+	idemApprovalPrefix           = "approve:"
+	idemCompletePrefix           = "complete:"
+	idemWithdrawalPrefix         = "withdraw:"
+	idemWithdrawalDecisionPrefix = "withdrawal_decision:"
 )
 
 // expireIfDue 若活跃仪式的当前轮已过截止时间则迁移到 expired，
@@ -751,6 +1078,7 @@ func expireIfDue(c *Ceremony, now time.Time) (expired bool, events []AuditEvent,
 		Kind:        AuditExpired,
 		Detail:      map[string]any{"deadline": r.Deadline.Format(time.RFC3339Nano)},
 	}}
+	events = append(events, closePendingWithdrawals(c, now, "ceremony_expired", "")...)
 	events = append(events, closePendingReplacements(c, now, "ceremony_expired", "")...)
 	addNotification(c, Notification{
 		At: now, CeremonyID: c.ID, Type: NtfCeremonyExpired, RoundNumber: r.Number,
@@ -765,7 +1093,8 @@ func expireIfDue(c *Ceremony, now time.Time) (expired bool, events []AuditEvent,
 // 全部修改都在调用方的仓储事务内完成。
 func applyReplacementApproval(c *Ceremony, req *Replacement, now time.Time) []AuditEvent {
 	old := c.CurrentRound()
-	invalidated := contributionsInMemberOrder(old)
+	invalidated := allContributionsInMemberOrder(old)
+	events := closePendingWithdrawals(c, now, "participants_replaced", "")
 	next := newRound(old.Number+1, req.NewMembers, c.Threshold, now, req.NewDeadline)
 	c.Rounds = append(c.Rounds, next)
 
@@ -778,7 +1107,7 @@ func applyReplacementApproval(c *Ceremony, req *Replacement, now time.Time) []Au
 		rec.RoundNumber = next.Number
 	}
 
-	events := []AuditEvent{{
+	events = append(events, AuditEvent{
 		At:          now,
 		CeremonyID:  c.ID,
 		RoundNumber: next.Number,
@@ -794,7 +1123,7 @@ func applyReplacementApproval(c *Ceremony, req *Replacement, now time.Time) []Au
 			"deadline":                  req.NewDeadline.Format(time.RFC3339Nano),
 			"reason":                    req.Reason,
 		},
-	}}
+	})
 	events = append(events, closePendingReplacements(c, now, "superseded:"+req.ID, req.ID)...)
 	addNotification(c, Notification{
 		At: now, CeremonyID: c.ID, Type: NtfReplacementApproved,
@@ -808,6 +1137,34 @@ func applyReplacementApproval(c *Ceremony, req *Replacement, now time.Time) []Au
 			"deadline":                  req.NewDeadline.Format(time.RFC3339Nano),
 		},
 	})
+	return events
+}
+
+// closePendingWithdrawals 关闭旧轮或终态中尚未决定的贡献撤回申请。
+// except 非空时跳过指定申请；贡献本身保留当前 pending_review 状态作为旧轮/终态审计快照。
+func closePendingWithdrawals(c *Ceremony, now time.Time, reason string, except string) []AuditEvent {
+	ids := make([]string, 0)
+	for id, w := range c.ContributionWithdrawals {
+		if w != nil && w.Status == WithdrawalPending && id != except {
+			ids = append(ids, id)
+		}
+	}
+	sort.Strings(ids)
+	events := make([]AuditEvent, 0, len(ids))
+	for _, id := range ids {
+		w := c.ContributionWithdrawals[id]
+		w.Status = WithdrawalClosed
+		w.DecidedAt = now
+		detail := map[string]any{"request_id": w.ID, "participant_id": w.ParticipantID, "reason": reason}
+		events = append(events, AuditEvent{
+			At: now, CeremonyID: c.ID, RoundNumber: w.RoundNumber,
+			Kind: AuditWithdrawalClosed, Actor: w.Reviewer, Detail: detail,
+		})
+		addNotification(c, Notification{
+			At: now, CeremonyID: c.ID, Type: NtfContributionWithdrawalClosed,
+			RoundNumber: w.RoundNumber, WithdrawalID: w.ID, Detail: detail,
+		})
+	}
 	return events
 }
 
@@ -891,6 +1248,55 @@ func contributionFingerprint(cv Contribution) string {
 	h.Write([]byte{0})
 	h.Write(cv.ShardDigest)
 	return hex.EncodeToString(h.Sum(nil))
+}
+
+func withdrawalFingerprint(round int, participant string, digest []byte, reason, reviewer string) string {
+	h := sha256.New()
+	h.Write([]byte(fmt.Sprint(round)))
+	h.Write([]byte{0})
+	h.Write([]byte(participant))
+	h.Write([]byte{0})
+	h.Write(digest)
+	h.Write([]byte{0})
+	h.Write([]byte(reason))
+	h.Write([]byte{0})
+	h.Write([]byte(reviewer))
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+func withdrawalDecisionFingerprint(withdrawalID, reviewer string, approve bool) string {
+	h := sha256.New()
+	h.Write([]byte(withdrawalID))
+	h.Write([]byte{0})
+	h.Write([]byte(reviewer))
+	h.Write([]byte{0})
+	if approve {
+		h.Write([]byte("approved"))
+	} else {
+		h.Write([]byte("rejected"))
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+func bytesEqual(a, b []byte) bool {
+	return bytes.Equal(a, b)
+}
+
+func contributionStatus(cv *Contribution) ContributionStatus {
+	if cv == nil || cv.Status == "" {
+		return ContributionValid
+	}
+	return cv.Status
+}
+
+func validContributionCount(r *Round) int {
+	count := 0
+	for _, cv := range r.Contributions {
+		if contributionStatus(cv) == ContributionValid {
+			count++
+		}
+	}
+	return count
 }
 
 func replacementFingerprint(requester string, members []string, deadline time.Time, reason string) string {
@@ -995,7 +1401,22 @@ func contributionsInMemberOrder(r *Round) []Contribution {
 	out := make([]Contribution, 0, len(r.Contributions))
 	for _, m := range r.Members {
 		if cv, ok := r.Contributions[m]; ok {
+			if contributionStatus(cv) != ContributionValid {
+				continue
+			}
 			out = append(out, *cloneContribution(cv))
+		}
+	}
+	return out
+}
+
+func allContributionsInMemberOrder(r *Round) []Contribution {
+	out := make([]Contribution, 0, len(r.Contributions))
+	for _, m := range r.Members {
+		if cv, ok := r.Contributions[m]; ok {
+			snapshot := *cloneContribution(cv)
+			snapshot.Status = contributionStatus(cv)
+			out = append(out, snapshot)
 		}
 	}
 	return out

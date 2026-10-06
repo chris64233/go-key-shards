@@ -17,6 +17,7 @@
 - **轮次（round）**：轮次号从 1 开始单调递增；每轮冻结当时的成员集合、
   门限与该轮自己的截止时间 `Round.Deadline`，独立累计贡献。
 - **贡献（contribution）**：同一参与者在同一轮次至多贡献一次；只接受当前轮次成员的贡献。
+- **贡献状态**：贡献分为有效、撤回待审核、已撤回；只有有效贡献计入门限并可被完成采用。
 - **门限**：当前轮有效贡献数达到门限才允许完成。
 - **终态**：`completed` / `canceled` / `expired`，进入后不可变更。
 - **outbox 唯一**：完成时冻结“实际采用的贡献集合”，并写出唯一的密钥激活消息；
@@ -37,6 +38,30 @@
 幂等按请求号（`RequestID`）判定，并记录首次提交时的轮次号：
 即使重试发生在轮次替换、截止过期或仪式完成之后，同号同内容的重试仍返回首次结果，
 而复用请求号提交不同内容（或改投其他轮次）一律判为冲突。
+
+## 贡献撤回审核
+
+当外部密码学组件确认某份贡献不应继续采用时，协调层使用独立的审核流程处理：
+
+1. `RequestContributionWithdrawal` 必须固定仪式、当前轮次、参与者、贡献的
+   `ShardDigest`、原因和审核人。仪式已完成、取消或过期后不能申请；旧轮次申请
+   仍按既有 `ErrStaleRound` 规则拒绝。
+2. 申请成功后，目标贡献进入 `pending_review`，立即不计入当前轮有效贡献，
+   因此完成会因 `ErrThresholdNotReached` 停在待补交状态，而不是采用待审贡献。
+3. 固定审核人调用 `ReviewContributionWithdrawal`：拒绝时贡献恢复 `valid`；
+   通过时贡献变为 `withdrawn`，撤回记录保留申请时的贡献快照、原因、审核人、
+   申请与决定时间，之后不可变。
+4. 待审核期间同一参与者不能补交；撤回通过后可以用新的贡献请求号补交。
+   若有效贡献不足，`GetRoundContributionStatus` 会在当前轮列出仍缺的参与者；
+   协调层不会自动开启无关新轮次。
+5. 撤回申请号同内容重放返回原记录；轮次、参与者、摘要、原因或审核人变化返回
+   `ErrConflict`。审核动作有独立请求号，也遵循同号同内容重放、异内容冲突。
+6. 参与者替换开启新轮、完成、取消、过期时，同事务关闭尚未决定的撤回请求。
+   所有这些迁移与补交、审核、完成都在单仪式事务内串行，只有一个结果生效。
+
+查询当前轮状态可调用 `GetRoundContributionStatus`，返回有效/待审核/已撤回数量、
+缺口成员和每条贡献的审核时间线；撤回记录也可通过 `GetContributionWithdrawal`
+与 `ListContributionWithdrawals` 查询。
 
 ## 完成前替换参与者：门限批准 + 显式新一轮
 
@@ -124,6 +149,21 @@ res, _ := svc.SubmitContribution(ctx, keyshards.ContributeInput{
     },
 })
 
+// 外部密码学组件要求停用 alice 的贡献：目标进入待审核并暂时不计门限
+w, _ := svc.RequestContributionWithdrawal(ctx, keyshards.WithdrawContributionInput{
+    CeremonyID: "cer-1", RequestID: "withdraw-alice-1",
+    RoundNumber: c.CurrentRound().Number, ParticipantID: "alice",
+    ContributionDigest: cryptoOut.SuspectShardDigest,
+    Reason: "external crypto validation failed", Reviewer: "auditor-1",
+})
+// auditor-1 审核：false 恢复有效；true 永久撤出并等待 alice 补交或补足门限
+w, _ = svc.ReviewContributionWithdrawal(ctx, keyshards.ReviewContributionWithdrawalInput{
+    CeremonyID: "cer-1", WithdrawalID: w.ID,
+    RequestID: "review-alice-1", Reviewer: "auditor-1", Approve: true,
+})
+status, contributions, _ := svc.GetRoundContributionStatus(ctx, "cer-1", 0)
+// status.MissingParticipants 列出当前仍缺少的有效贡献；补齐后才能 Complete
+
 // 完成前替换参与者（bob 无法继续）：alice 发起，指定完整新集合与新轮截止时间
 rep, _ := svc.InitiateReplacement(ctx, keyshards.InitiateReplacementInput{
     CeremonyID: "cer-1", RequestID: "rotate-bob-1", RequestedBy: "alice",
@@ -171,11 +211,14 @@ events, _ := svc.Audit(ctx, "cer-1", 0 /*fromSeq*/, 0 /*limit*/)
 
 ### 审计
 
-所有状态迁移（created / contributed / replacement_initiated /
+所有状态迁移（created / contributed / contribution_withdrawal_requested /
+contribution_withdrawal_approved / contribution_withdrawal_rejected /
+contribution_withdrawal_closed / replacement_initiated /
 replacement_approved_vote / participants_replaced / replacement_withdrawn /
 replacement_closed / completed / canceled / expired）以及被拒绝的操作
 （rejected，含原因）都写入按仪式单调递增的事件流；贡献事件只记录承诺与
-分片摘要的十六进制编码，没有任何明文字段。
+分片摘要的十六进制编码，没有任何明文字段。撤回记录中的贡献快照同样只包含
+承诺与分片摘要。
 
 ## 运行测试
 

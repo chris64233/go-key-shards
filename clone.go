@@ -18,6 +18,8 @@ func cloneContribution(cv *Contribution) *Contribution {
 		ParticipantID: cv.ParticipantID,
 		Commitment:    cloneBytes(cv.Commitment),
 		ShardDigest:   cloneBytes(cv.ShardDigest),
+		Status:        cv.Status,
+		WithdrawalID:  cv.WithdrawalID,
 	}
 }
 
@@ -65,6 +67,24 @@ func cloneReplacement(req *Replacement) *Replacement {
 	}
 }
 
+func cloneWithdrawal(w *ContributionWithdrawal) *ContributionWithdrawal {
+	if w == nil {
+		return nil
+	}
+	return &ContributionWithdrawal{
+		ID:                 w.ID,
+		Status:             w.Status,
+		RoundNumber:        w.RoundNumber,
+		ParticipantID:      w.ParticipantID,
+		ContributionDigest: cloneBytes(w.ContributionDigest),
+		Contribution:       *cloneContribution(&w.Contribution),
+		Reason:             w.Reason,
+		Reviewer:           w.Reviewer,
+		RequestedAt:        w.RequestedAt,
+		DecidedAt:          w.DecidedAt,
+	}
+}
+
 func cloneNotification(n Notification) Notification {
 	detail := make(map[string]any, len(n.Detail))
 	for k, v := range n.Detail {
@@ -76,6 +96,7 @@ func cloneNotification(n Notification) Notification {
 		At:            n.At,
 		Type:          n.Type,
 		ReplacementID: n.ReplacementID,
+		WithdrawalID:  n.WithdrawalID,
 		RoundNumber:   n.RoundNumber,
 		Detail:        detail,
 	}
@@ -111,6 +132,10 @@ func cloneCeremony(c *Ceremony) *Ceremony {
 	for k, v := range c.Replacements {
 		reps[k] = cloneReplacement(v)
 	}
+	withdrawals := make(map[string]*ContributionWithdrawal, len(c.ContributionWithdrawals))
+	for k, v := range c.ContributionWithdrawals {
+		withdrawals[k] = cloneWithdrawal(v)
+	}
 	ntfs := make([]Notification, len(c.Notifications))
 	for i, n := range c.Notifications {
 		ntfs[i] = cloneNotification(n)
@@ -125,17 +150,18 @@ func cloneCeremony(c *Ceremony) *Ceremony {
 		idem[k] = &cp
 	}
 	return &Ceremony{
-		ID:            c.ID,
-		Threshold:     c.Threshold,
-		Deadline:      c.Deadline,
-		CreatedAt:     c.CreatedAt,
-		CancelReason:  c.CancelReason,
-		Rounds:        rounds,
-		Replacements:  reps,
-		Notifications: ntfs,
-		Status:        c.Status,
-		Outbox:        cloneOutbox(c.Outbox),
-		Idempotency:   idem,
+		ID:                      c.ID,
+		Threshold:               c.Threshold,
+		Deadline:                c.Deadline,
+		CreatedAt:               c.CreatedAt,
+		CancelReason:            c.CancelReason,
+		Rounds:                  rounds,
+		Replacements:            reps,
+		ContributionWithdrawals: withdrawals,
+		Notifications:           ntfs,
+		Status:                  c.Status,
+		Outbox:                  cloneOutbox(c.Outbox),
+		Idempotency:             idem,
 	}
 }
 

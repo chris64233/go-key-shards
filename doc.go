@@ -1,6 +1,6 @@
 // Package keyshards 实现门限密钥分片仪式的状态协调层。
 //
-// 本包只做状态编排（仪式、轮次、成员、门限、替换批准、幂等、终态、
+// 本包只做状态编排（仪式、轮次、成员、门限、贡献撤回审核、替换批准、幂等、终态、
 // 事务性通知与 outbox、审计），不实现任何密码学计算：承诺（Commitment）
 // 与分片摘要（ShardDigest）均由外部密码学组件产出，协调层不接受也不记录
 // 秘密分片明文。
@@ -12,7 +12,14 @@
 // 保留新旧轮次、批准人与失效贡献快照的关联，可通过 GetReplacement /
 // ListReplacements 查询；通知通过 Notifications 按序消费。
 //
-// 主要类型：Service 提供创建/贡献/替换发起/替换批准/撤销/完成/取消/查询操作；
+// 外部密码学组件确认某份贡献不应继续采用时，RequestContributionWithdrawal
+// 固定仪式、当前轮次、参与者、ShardDigest、原因和审核人，并把贡献暂时移出
+// 门限计数。ReviewContributionWithdrawal 拒绝则恢复有效，通过则保留不可变
+// 撤回记录且该贡献不可再被完成采用；有效贡献不足时仪式保持当前轮并等待补交，
+// 不自动开启新轮。GetRoundContributionStatus 区分有效、待审核与已撤回贡献，
+// 并给出当前仍缺的有效参与者。
+//
+// 主要类型：Service 提供创建/贡献/撤回申请/撤回审核/替换发起/替换批准/撤销/完成/取消/查询操作；
 // Repository 抽象原子的单仪式读-改-写持久化，实现见 MemRepository 与
 // FileRepository。
 package keyshards

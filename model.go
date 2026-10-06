@@ -32,7 +32,23 @@ type Contribution struct {
 	Commitment []byte
 	// ShardDigest 外部密码学组件给出的分片摘要，不透明字节；绝不记录分片明文。
 	ShardDigest []byte
+	// Status 标识该参与者当前轮贡献的审核状态；空值与 valid 均表示有效。
+	Status ContributionStatus `json:"status,omitempty"`
+	// WithdrawalID 正在审核或已撤回该贡献的请求号。
+	WithdrawalID string `json:"withdrawal_id,omitempty"`
 }
+
+// ContributionStatus 是贡献当前是否可被门限采用的状态。
+type ContributionStatus string
+
+const (
+	// ContributionValid 贡献有效，可计入当前轮门限。
+	ContributionValid ContributionStatus = "valid"
+	// ContributionReviewPending 贡献正在等待撤回审核，不计入门限。
+	ContributionReviewPending ContributionStatus = "pending_review"
+	// ContributionWithdrawn 撤回已通过，贡献不可再被采用。
+	ContributionWithdrawn ContributionStatus = "withdrawn"
+)
 
 // Round 记录一轮参与者集合与其上的有效贡献。
 type Round struct {
@@ -120,6 +136,49 @@ type Replacement struct {
 	DecidedAt time.Time `json:"decided_at,omitempty"`
 }
 
+// ContributionWithdrawalStatus 是贡献撤回审核请求的生命周期状态。
+type ContributionWithdrawalStatus string
+
+const (
+	// WithdrawalPending 贡献撤回申请正在等待审核。
+	WithdrawalPending ContributionWithdrawalStatus = "pending"
+	// WithdrawalApproved 撤回通过，关联贡献已永久撤出当前轮门限。
+	WithdrawalApproved ContributionWithdrawalStatus = "approved"
+	// WithdrawalRejected 撤回拒绝，关联贡献恢复有效。
+	WithdrawalRejected ContributionWithdrawalStatus = "rejected"
+	// WithdrawalClosed 申请待审期间轮次被替换或仪式进入终态，申请不再可审。
+	WithdrawalClosed ContributionWithdrawalStatus = "closed"
+)
+
+// IsFinal 报告撤回审核状态是否不可再变更。
+func (s ContributionWithdrawalStatus) IsFinal() bool {
+	return s == WithdrawalApproved || s == WithdrawalRejected || s == WithdrawalClosed
+}
+
+// ContributionWithdrawal 是一次外部密码学组件要求停用某份贡献的审核记录。
+type ContributionWithdrawal struct {
+	// ID 撤回请求号，仪式内唯一且幂等。
+	ID string `json:"id"`
+	// Status 审核状态。
+	Status ContributionWithdrawalStatus `json:"status"`
+	// RoundNumber 申请固定针对的轮次。
+	RoundNumber int `json:"round_number"`
+	// ParticipantID 申请固定针对的参与者。
+	ParticipantID string `json:"participant_id"`
+	// ContributionDigest 申请固定针对的贡献摘要（ShardDigest）。
+	ContributionDigest []byte `json:"contribution_digest"`
+	// Contribution 申请瞬间的贡献快照，撤回通过后作为不可变记录保留。
+	Contribution Contribution `json:"contribution"`
+	// Reason 外部密码学组件或申请人给出的撤回原因。
+	Reason string `json:"reason"`
+	// Reviewer 固定审核人；只有该审核人可以作出通过/拒绝决定。
+	Reviewer string `json:"reviewer"`
+	// RequestedAt 申请时间。
+	RequestedAt time.Time `json:"requested_at"`
+	// DecidedAt 通过、拒绝或关闭时间。
+	DecidedAt time.Time `json:"decided_at,omitempty"`
+}
+
 // Notification 是与状态迁移在同一事务内保存的通知（事务性 outbox）。
 //
 // 协调层不直接投递：外部投递组件按顺序读取并负责至少一次投递，
@@ -135,10 +194,30 @@ type Notification struct {
 	Type string `json:"type"`
 	// ReplacementID 关联的替换请求（替换类通知）。
 	ReplacementID string `json:"replacement_id,omitempty"`
+	// WithdrawalID 关联的贡献撤回请求。
+	WithdrawalID string `json:"withdrawal_id,omitempty"`
 	// RoundNumber 关联轮次。
 	RoundNumber int `json:"round_number,omitempty"`
 	// Detail 通知负载（批准人、失效贡献者、新截止时间等）。
 	Detail map[string]any `json:"detail,omitempty"`
+}
+
+// ContributionReview 是查询返回的一条贡献及其撤回审核时间线。
+type ContributionReview struct {
+	RoundNumber  int                     `json:"round_number"`
+	Contribution Contribution            `json:"contribution"`
+	Status       ContributionStatus      `json:"status"`
+	Withdrawal   *ContributionWithdrawal `json:"withdrawal,omitempty"`
+}
+
+// RoundContributionStatus 汇总当前轮门限、有效贡献与尚缺成员。
+type RoundContributionStatus struct {
+	RoundNumber         int      `json:"round_number"`
+	Threshold           int      `json:"threshold"`
+	ValidCount          int      `json:"valid_count"`
+	PendingReviewCount  int      `json:"pending_review_count"`
+	WithdrawnCount      int      `json:"withdrawn_count"`
+	MissingParticipants []string `json:"missing_participants"`
 }
 
 // 通知类型。
@@ -155,6 +234,14 @@ const (
 	NtfCeremonyCompleted = "ceremony_completed"
 	// NtfCeremonyExpired 当前轮超过截止时间，仪式过期。
 	NtfCeremonyExpired = "ceremony_expired"
+	// NtfContributionWithdrawalRequested 贡献进入撤回待审核。
+	NtfContributionWithdrawalRequested = "contribution_withdrawal_requested"
+	// NtfContributionWithdrawalApproved 撤回通过，贡献已撤出。
+	NtfContributionWithdrawalApproved = "contribution_withdrawal_approved"
+	// NtfContributionWithdrawalRejected 撤回拒绝，贡献恢复有效。
+	NtfContributionWithdrawalRejected = "contribution_withdrawal_rejected"
+	// NtfContributionWithdrawalClosed 待审核撤回因轮次替换或仪式终态关闭。
+	NtfContributionWithdrawalClosed = "contribution_withdrawal_closed"
 )
 
 // Ceremony 是状态协调层的聚合根。
@@ -177,6 +264,8 @@ type Ceremony struct {
 	// Replacements 替换请求按发起顺序保存（幂等 ID 为键）；
 	// 每个 approved 请求恰好关联一对（旧轮, 新轮）与一份失效贡献快照。
 	Replacements map[string]*Replacement `json:"replacements,omitempty"`
+	// ContributionWithdrawals 贡献撤回审核记录，按撤回请求号索引。
+	ContributionWithdrawals map[string]*ContributionWithdrawal `json:"contribution_withdrawals,omitempty"`
 
 	// Notifications 事务性通知，按 Seq 有序追加。
 	Notifications []Notification `json:"notifications,omitempty"`
@@ -201,6 +290,8 @@ type IdemRecord struct {
 	ContributionCount int `json:"contribution_count,omitempty"`
 	// ReplacementID 替换/批准请求关联的替换记录 ID。
 	ReplacementID string `json:"replacement_id,omitempty"`
+	// WithdrawalID 贡献撤回/审核请求关联的记录 ID。
+	WithdrawalID string `json:"withdrawal_id,omitempty"`
 }
 
 // CurrentRound 返回仪式当前（最新）轮次。
@@ -235,4 +326,8 @@ const (
 	AuditCompleted            = "completed"
 	AuditCanceled             = "canceled"
 	AuditExpired              = "expired"
+	AuditWithdrawalRequested  = "contribution_withdrawal_requested"
+	AuditWithdrawalApproved   = "contribution_withdrawal_approved"
+	AuditWithdrawalRejected   = "contribution_withdrawal_rejected"
+	AuditWithdrawalClosed     = "contribution_withdrawal_closed"
 )
